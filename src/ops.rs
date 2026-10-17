@@ -9,7 +9,9 @@ use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSDeviceRGBColorSpace, NSGraphicsContext,
     NSWorkspace,
 };
+use objc2_app_kit::NSImage;
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+use objc2_uniform_type_identifiers::UTType;
 
 /// Moves `path` to the Trash of its volume. Uses NSFileManager directly rather than
 /// scripting Finder, which would ask for Automation permission.
@@ -104,6 +106,18 @@ pub fn has_full_disk_access() -> bool {
 /// Finder's icon for `path` as a square PNG of `pixels` × `pixels`.
 pub fn icon_png(path: &Path, pixels: isize) -> Option<Vec<u8>> {
     let image = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&path.to_string_lossy()));
+    render_png(&image, pixels)
+}
+
+/// Finder's icon for files with the extension `ext` ("" for files without one).
+pub fn type_icon_png(ext: &str, pixels: isize) -> Option<Vec<u8>> {
+    let content_type = UTType::typeWithFilenameExtension(&NSString::from_str(ext))
+        .unwrap_or_else(|| UTType::typeWithIdentifier(&NSString::from_str("public.data")).expect("public.data"));
+    let image = NSWorkspace::sharedWorkspace().iconForContentType(&content_type);
+    render_png(&image, pixels)
+}
+
+fn render_png(image: &NSImage, pixels: isize) -> Option<Vec<u8>> {
     // SAFETY: a null planes pointer makes the rep allocate its own buffer; the arguments
     // describe a valid 8-bit RGBA layout.
     let rep = unsafe {
@@ -177,5 +191,9 @@ mod tests {
     fn icons_render_as_png() {
         let png = icon_png(Path::new("/Applications"), 32).expect("icon");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        for ext in ["pdf", "", "no-such-extension"] {
+            let png = type_icon_png(ext, 32).expect("type icon");
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        }
     }
 }

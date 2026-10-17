@@ -13,7 +13,7 @@ use super::state::{
     AppState, Busy, Mode, Overview, home_dir, is_protected, use_app_state, use_list_trigger,
 };
 use super::sunburst::Sunburst;
-use super::{SessionRef, format, icon_url};
+use super::{SessionRef, format, icon_url, type_icon_url};
 use crate::ops;
 use crate::tree::{NodeId, ROOT, Tree, flags};
 
@@ -34,10 +34,18 @@ struct Row {
     /// Second line in list mode: the folder containing the item.
     detail: Option<String>,
     protected: bool,
+    icon: String,
 }
 
 fn row(tree: &Tree, id: NodeId, detail: Option<String>) -> Row {
     let n = tree.node(id);
+    let path = tree.path(id);
+    // Plain files share their type's icon; drawing one per file made large folders slow.
+    let icon = if n.kind() == crate::tree::Kind::File {
+        type_icon_url(&path)
+    } else {
+        icon_url(&path)
+    };
     Row {
         id,
         name: tree.display_name(id).into_owned(),
@@ -45,9 +53,10 @@ fn row(tree: &Tree, id: NodeId, detail: Option<String>) -> Row {
         is_dir: n.is_dir(),
         has_children: n.first_child != crate::tree::NONE,
         hidden: n.has(flags::HIDDEN),
-        path: tree.path(id),
+        path,
         detail,
         protected: is_protected(tree, id),
+        icon,
     }
 }
 
@@ -186,15 +195,12 @@ fn Columns(session: SessionRef, root: NodeId, selection: Vec<NodeId>) -> Element
             preview = Some(row(&tree, folder, None));
             break;
         }
-        let kids = tree.sorted_children(folder);
-        let shown = if view.expanded.contains(&folder) { kids.len() } else { ROW_LIMIT };
-        let more = (kids.len() > shown).then(|| {
-            let rest = &kids[shown..];
-            (rest.len(), rest.iter().map(|&k| tree.size(k)).sum())
-        });
+        let limit = if view.expanded.contains(&folder) { usize::MAX } else { ROW_LIMIT };
+        let (kids, rest, rest_size) = tree.largest_children(folder, limit);
+        let more = (rest > 0).then_some((rest, rest_size));
         columns.push(Column {
             folder,
-            rows: kids.iter().take(shown).map(|&k| row(&tree, k, None)).collect(),
+            rows: kids.iter().map(|&k| row(&tree, k, None)).collect(),
             more,
             selected: selection.get(i).copied(),
         });
@@ -364,7 +370,7 @@ fn ItemRow(
                     });
                 },
             }
-            img { class: "icon", src: "{icon_url(&row.path)}", width: "16", height: "16", loading: "lazy" }
+            img { class: "icon", src: "{row.icon}", width: "16", height: "16", loading: "lazy" }
             div { class: "label",
                 span { class: "name", title: "{row.name}", "{row.name}" }
                 if let Some(d) = &row.detail {

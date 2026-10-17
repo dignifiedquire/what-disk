@@ -37,11 +37,17 @@ fn place(tree: &Tree, parent: NodeId, start: f64, span: f64, depth: usize, out: 
     if parent_size == 0 || depth > RINGS {
         return;
     }
+    // Only children wide enough to draw can appear. Pick them before sorting: a folder can
+    // hold hundreds of thousands of entries, and sorting all of them on every redraw blocked
+    // the interface.
+    let min_size = (MIN_ANGLE / span * parent_size as f64) as u64;
+    let mut kids: Vec<NodeId> = tree.children(parent).filter(|&c| tree.size(c) > min_size).collect();
+    kids.sort_unstable_by(|&a, &b| tree.size(b).cmp(&tree.size(a)).then(a.cmp(&b)));
     let mut angle = start;
-    for child in tree.sorted_children(parent) {
+    for child in kids {
         let child_span = span * tree.size(child) as f64 / parent_size as f64;
         if child_span < MIN_ANGLE {
-            break; // Children are sorted, so all remaining ones are smaller.
+            break;
         }
         let is_dir = tree.node(child).is_dir();
         out.push(Segment { id: child, depth, start: angle, end: angle + child_span, is_dir });

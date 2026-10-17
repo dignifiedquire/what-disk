@@ -303,30 +303,11 @@ fn App() -> Element {
 
     dioxus::desktop::use_asset_handler("icon", move |request, responder| {
         let path = percent_decode(request.uri().path().trim_start_matches("/icon"));
-        let pixels: isize = request
-            .uri()
-            .query()
-            .and_then(|q| q.strip_prefix("size="))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32)
-            .clamp(16, 256);
-        let png = ICONS.with(|cache| {
-            cache
-                .borrow_mut()
-                .entry((path.clone(), pixels))
-                .or_insert_with(|| ops::icon_png(std::path::Path::new(&path), pixels))
-                .clone()
-        });
-        let response = match png {
-            Some(bytes) => dioxus::desktop::wry::http::Response::builder()
-                .header("Content-Type", "image/png")
-                .header("Cache-Control", "max-age=3600")
-                .body(bytes),
-            None => dioxus::desktop::wry::http::Response::builder()
-                .status(404)
-                .body(Vec::new()),
-        };
-        responder.respond(response.expect("valid response"));
+        serve_icon(responder, IconKey::Path(path), icon_pixels(&request));
+    });
+    dioxus::desktop::use_asset_handler("filetype", move |request, responder| {
+        let ext = percent_decode(request.uri().path().trim_start_matches("/filetype/"));
+        serve_icon(responder, IconKey::FileType(ext), icon_pixels(&request));
     });
 
     dioxus::desktop::use_muda_event_handler(move |event| {
@@ -397,8 +378,66 @@ fn use_debug_console(state: AppState) {
     });
 }
 
-thread_local! {
-    static ICONS: std::cell::RefCell<HashMap<(String, isize), Option<Vec<u8>>>> = Default::default();
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum IconKey {
+    Path(String),
+    FileType(String),
+}
+
+type IconCache = HashMap<(IconKey, isize), Option<Arc<Vec<u8>>>>;
+
+/// Rendered icons; cleared when it grows past this many entries.
+static ICONS: std::sync::LazyLock<parking_lot::Mutex<IconCache>> = std::sync::LazyLock::new(Default::default);
+const ICON_CACHE_LIMIT: usize = 4096;
+
+fn icon_pixels(request: &dioxus::desktop::AssetRequest) -> isize {
+    request
+        .uri()
+        .query()
+        .and_then(|q| q.strip_prefix("size="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32)
+        .clamp(16, 256)
+}
+
+/// Answers an icon request from the cache, or renders the icon off the main thread: a large
+/// folder requests many icons at once, and drawing them on the main thread froze the window.
+fn serve_icon(responder: dioxus::desktop::RequestAsyncResponder, key: IconKey, pixels: isize) {
+    if let Some(png) = ICONS.lock().get(&(key.clone(), pixels)).cloned() {
+        respond_png(responder, png);
+        return;
+    }
+    spawn(async move {
+        let job = key.clone();
+        let png = tokio::task::spawn_blocking(move || {
+            objc2::rc::autoreleasepool(|_| match &job {
+                IconKey::Path(path) => ops::icon_png(std::path::Path::new(path), pixels),
+                IconKey::FileType(ext) => ops::type_icon_png(ext, pixels),
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(Arc::new);
+        let mut cache = ICONS.lock();
+        if cache.len() >= ICON_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert((key, pixels), png.clone());
+        drop(cache);
+        respond_png(responder, png);
+    });
+}
+
+fn respond_png(responder: dioxus::desktop::RequestAsyncResponder, png: Option<Arc<Vec<u8>>>) {
+    let response = match png {
+        Some(bytes) => dioxus::desktop::wry::http::Response::builder()
+            .header("Content-Type", "image/png")
+            .header("Cache-Control", "max-age=3600")
+            .body(bytes.as_ref().clone()),
+        None => dioxus::desktop::wry::http::Response::builder().status(404).body(Vec::new()),
+    };
+    responder.respond(response.expect("valid response"));
 }
 
 fn percent_decode(s: &str) -> String {
@@ -422,8 +461,18 @@ fn percent_decode(s: &str) -> String {
 
 /// URL under which the icon handler serves Finder's icon for `path`.
 pub fn icon_url(path: &std::path::Path) -> String {
-    let mut out = String::from("/icon");
-    for b in path.as_os_str().as_encoded_bytes() {
+    percent_encode("/icon", path.as_os_str().as_encoded_bytes())
+}
+
+/// URL of the icon Finder shows for any file with the same extension as `path`.
+pub fn type_icon_url(path: &std::path::Path) -> String {
+    let ext = path.extension().map_or(&[][..], |e| e.as_encoded_bytes());
+    percent_encode("/filetype/", &ext.to_ascii_lowercase())
+}
+
+fn percent_encode(prefix: &str, bytes: &[u8]) -> String {
+    let mut out = String::from(prefix);
+    for b in bytes {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*b as char)

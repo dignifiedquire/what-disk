@@ -10,8 +10,9 @@ dioxus = { version = "0.7.7", features = ["desktop"] }
 dua-core = "5"
 libc = "0.2.191"
 objc2 = "0.6.5"
-objc2-app-kit = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = ["objc2-uniform-type-identifiers"] }
 objc2-foundation = "0.3.2"
+objc2-uniform-type-identifiers = "0.3.2"
 parking_lot = "0.12.5"
 quicklook = "0.2.2"
 rfd = "0.17.2"

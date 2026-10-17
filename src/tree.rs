@@ -213,6 +213,23 @@ impl Tree {
         v
     }
 
+    /// The `limit` largest children, largest first, plus how many others there are and their
+    /// total size. Selects before sorting, so a folder with a million entries costs one pass
+    /// instead of a full sort.
+    pub fn largest_children(&self, id: NodeId, limit: usize) -> (Vec<NodeId>, usize, u64) {
+        let order = |a: &NodeId, b: &NodeId| {
+            self.size(*b).cmp(&self.size(*a)).then_with(|| self.name(*a).cmp(self.name(*b)))
+        };
+        let mut kids: Vec<NodeId> = self.children(id).collect();
+        let mut rest = Vec::new();
+        if kids.len() > limit {
+            kids.select_nth_unstable_by(limit, order);
+            rest = kids.split_off(limit);
+        }
+        kids.sort_by(order);
+        (kids, rest.len(), rest.iter().map(|&k| self.size(k)).sum())
+    }
+
     /// Ids from the root down to and including `id`.
     pub fn ancestry(&self, id: NodeId) -> Vec<NodeId> {
         let mut v = Vec::new();
@@ -453,6 +470,20 @@ mod tests {
     fn sorted_children_are_largest_first() {
         let (t, [a, _, _, app, _, c]) = sample();
         assert_eq!(t.sorted_children(ROOT), vec![a, app, c]);
+    }
+
+    #[test]
+    fn largest_children_match_a_full_sort_and_summarise_the_rest() {
+        let mut t = Tree::new("/r".into(), "r", 0);
+        for i in 0..50u64 {
+            t.add(ROOT, format!("f{i:02}").as_bytes(), Kind::File, 0, (i * 7919) % 101, 0);
+        }
+        let all = t.sorted_children(ROOT);
+        let (top, rest, rest_size) = t.largest_children(ROOT, 10);
+        assert_eq!(top, all[..10].to_vec());
+        assert_eq!(rest, 40);
+        assert_eq!(rest_size, all[10..].iter().map(|&k| t.size(k)).sum::<u64>());
+        assert_eq!(t.largest_children(ROOT, 100), (all, 0, 0));
     }
 
     #[test]
