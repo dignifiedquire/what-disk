@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use dioxus::prelude::*;
 
 use super::format;
@@ -34,6 +36,7 @@ pub fn Toolbar() -> Element {
     }
     let busy = resolved.as_ref().map(|(s, _)| s.busy());
     let paused = resolved.as_ref().is_some_and(|(s, _)| s.is_paused());
+    let pausing = busy == Some(Busy::Scanning) && resolved.as_ref().is_some_and(|(s, _)| s.stop.load(Ordering::Relaxed));
     if let Some((session, _)) = &resolved
         && busy == Some(Busy::Idle)
     {
@@ -110,26 +113,30 @@ pub fn Toolbar() -> Element {
                 if let Some((session, _)) = resolved.clone() {
                     if busy == Some(Busy::Scanning) {
                         button {
-                            class: "toolbar-button",
-                            title: "Pause Scanning",
+                            class: "toolbar-button labeled",
+                            title: "Pause scanning and keep the results so far",
+                            disabled: pausing,
                             onclick: move |_| state.stop(&session),
                             Symbol { icon: Icon::Pause }
+                            span { if pausing { "Pausing…" } else { "Pause" } }
                         }
                     } else if matches!(busy, Some(Busy::Rescanning(_))) {
                         button {
-                            class: "toolbar-button",
-                            title: "Stop Rescanning",
+                            class: "toolbar-button labeled",
+                            title: "Stop rescanning and keep the previous results",
                             onclick: move |_| state.stop(&session),
                             Symbol { icon: Icon::Stop }
+                            span { "Stop" }
                         }
                     } else {
                         if paused {
                             button {
-                                class: "toolbar-button",
-                                title: "Resume Scanning",
+                                class: "toolbar-button labeled",
+                                title: "Continue the scan where it was paused",
                                 disabled: busy != Some(Busy::Idle),
                                 onclick: move |_| state.resume_scan(session.clone()),
                                 Symbol { icon: Icon::Resume }
+                                span { "Resume" }
                             }
                         }
                         button {

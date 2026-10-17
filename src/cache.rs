@@ -3,9 +3,12 @@
 //! File layout (all integers little-endian):
 //! `MAGIC`, a fixed-size [`Header`], the root path, then a zstd stream holding the node array,
 //! the names buffer and, for a scan that is not finished, the folders still to read (paths
-//! relative to the root, separated by NUL) and the hard links counted so far. The header can be read without decompressing the
-//! tree, so the sidebar can show sizes and scan dates of every cached root instantly.
+//! relative to the root, separated by NUL) and the hard links counted so far. The header can
+//! be read without decompressing the tree, so the sidebar can show sizes and scan dates of
+//! every cached root instantly.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -163,17 +166,30 @@ pub fn load(dir: &Path, root: &Path) -> io::Result<(Tree, Summary, Vec<NodeId>, 
     let mut links = vec![0u64; h.links_count as usize * 2];
     z.read_exact(bytemuck::cast_slice_mut(&mut links))?;
     let tree = Tree::from_parts(cached_root.clone(), nodes, names);
-    let pending = if h.complete != 0 {
-        Vec::new()
-    } else {
-        // An empty path is the root: a scan stopped before it read anything.
-        pending_paths
-            .split(|&b| b == 0)
-            .filter_map(|rel| tree.find(&cached_root.join(std::ffi::OsStr::from_bytes(rel))))
-            .collect()
-    };
+    let pending = if h.complete != 0 { Vec::new() } else { find_folders(&tree, &pending_paths) };
     let counted = links.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect();
     Ok((tree, summary(&h, cached_root), pending, counted))
+}
+
+/// The folders at `rel_paths`: paths relative to the root, separated by NUL; an empty path is
+/// the root. Each folder's children are indexed by name once: thousands of pending folders
+/// often sit in a folder with even more items, and searching its list for each of them took
+/// minutes.
+fn find_folders(tree: &Tree, rel_paths: &[u8]) -> Vec<NodeId> {
+    let mut by_name: HashMap<NodeId, HashMap<&OsStr, NodeId>> = HashMap::new();
+    rel_paths
+        .split(|&b| b == 0)
+        .filter_map(|rel| {
+            let mut cur = ROOT;
+            for part in Path::new(OsStr::from_bytes(rel)).components() {
+                let children = by_name
+                    .entry(cur)
+                    .or_insert_with(|| tree.children(cur).map(|c| (tree.name(c), c)).collect());
+                cur = *children.get(part.as_os_str())?;
+            }
+            Some(cur)
+        })
+        .collect()
 }
 
 pub fn remove(dir: &Path, root: &Path) -> io::Result<()> {
@@ -239,6 +255,26 @@ mod tests {
         assert_eq!(paths, vec![PathBuf::from("/data/a/b"), PathBuf::from("/data/c d")]);
         assert_eq!(links, counted);
         assert!(!list(dir.path())[0].complete);
+    }
+
+    #[test]
+    fn many_unfinished_folders_in_one_large_folder_load_quickly() {
+        // A paused scan of a whole disk had 63,000 pending folders, many of them in folders
+        // with tens of thousands of items. Looking each up from the root made loading it take
+        // almost two minutes; the bound here is far above the expected milliseconds and far
+        // below what that took.
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = Tree::new("/data".into(), "Data", 0);
+        let big = t.add(ROOT, b"big", Kind::Dir, 0, 0, 0);
+        let folders: Vec<NodeId> =
+            (0..40_000).map(|i| t.add(big, format!("f{i}").as_bytes(), Kind::Dir, 0, 0, 0)).collect();
+        save(dir.path(), &t, UNIX_EPOCH, &folders, &CountedLinks::new()).unwrap();
+
+        let started = std::time::Instant::now();
+        let (loaded, _, pending, _) = load(dir.path(), Path::new("/data")).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(pending.len(), folders.len());
+        assert_eq!(loaded.path(pending[123]), PathBuf::from(format!("/data/big/f{}", 123)));
     }
 
     #[test]

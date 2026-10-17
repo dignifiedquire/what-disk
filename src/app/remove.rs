@@ -26,6 +26,7 @@ pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
     drop(tree);
     let items = session.progress.files.load(Ordering::Relaxed) + session.progress.dirs.load(Ordering::Relaxed);
     let used = state.volume_of(&session.root).map(|v| v.used());
+    let verb = if session.stop.load(Ordering::Relaxed) { "Pausing…" } else { "Scanning…" };
 
     let status = match busy {
         Busy::Scanning => {
@@ -37,7 +38,7 @@ pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
                         div { class: "progress-fill", style: "width: {percent.unwrap_or(30.0)}%" }
                     }
                     span { class: "status-text",
-                        "Scanning… {format::count(items)} items · {format::bytes(scanned)}"
+                        "{verb} {format::count(items)} items · {format::bytes(scanned)}"
                         if let Some(u) = used {
                             " of {format::bytes(u)} used"
                         }

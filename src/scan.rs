@@ -5,7 +5,8 @@
 //! applies each folder's listing to the shared tree, so the UI can show live totals, and
 //! queues the subfolders it finds. Because a folder counts as read only once its listing is
 //! applied, a scan can stop at any time and later continue with exactly the folders that are
-//! still queued.
+//! still queued. Stopping abandons folders being read, so a pause does not wait for a folder
+//! with hundreds of thousands of items; they are read again when the scan continues.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -47,7 +48,9 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Reads the folders `folders` of `tree` and everything below them that `boundary` allows.
 /// Pass `vec![ROOT]` for a new scan, or a previous [`Outcome::Paused`] list to continue one.
-/// Stops when `stop` is set, or after `deadline` once at least one folder was read.
+/// Stops soon after `stop` is set, or after `deadline` once at least one folder was read and
+/// the folders being read are finished: a folder abandoned at every deadline would never be
+/// read completely.
 pub fn scan(
     tree: &RwLock<Tree>,
     boundary: &Boundary,
@@ -76,7 +79,7 @@ pub fn scan(
         for _ in 0..threads {
             let tx = tx.clone();
             let (queue, ready) = (&queue, &ready);
-            scope.spawn(move || work(queue, ready, tx));
+            scope.spawn(move || work(queue, ready, stop, tx));
         }
         drop(tx);
 
@@ -137,7 +140,8 @@ struct Queue {
 struct Listing {
     dir: NodeId,
     path: PathBuf,
-    items: io::Result<Vec<Item>>,
+    /// `None` if reading was abandoned because the scan stopped.
+    items: Option<io::Result<Vec<Item>>>,
 }
 
 struct Item {
@@ -159,7 +163,7 @@ fn mtime_of(m: &std::fs::Metadata) -> u32 {
     u32::try_from(m.mtime().max(0)).unwrap_or(u32::MAX)
 }
 
-fn work(queue: &Mutex<Queue>, ready: &Condvar, tx: mpsc::Sender<Listing>) {
+fn work(queue: &Mutex<Queue>, ready: &Condvar, stop: &AtomicBool, tx: mpsc::Sender<Listing>) {
     loop {
         let (dir, path) = {
             let mut q = queue.lock();
@@ -174,17 +178,28 @@ fn work(queue: &Mutex<Queue>, ready: &Condvar, tx: mpsc::Sender<Listing>) {
                 ready.wait(&mut q);
             }
         };
-        let items = read_folder(&path);
+        let items = read_folder(&path, stop);
         if tx.send(Listing { dir, path, items }).is_err() {
             return;
         }
     }
 }
 
-/// One folder's entries with their metadata, from a single bulk read where possible.
-fn read_folder(path: &Path) -> io::Result<Vec<Item>> {
+/// One folder's entries with their metadata, from a single bulk read where possible. `None`
+/// if `stop` was set before the whole folder was read.
+fn read_folder(path: &Path, stop: &AtomicBool) -> Option<io::Result<Vec<Item>>> {
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let entries = match dua_core::read_dir(path, Options::default()) {
+        Ok(entries) => entries,
+        Err(e) => return Some(Err(e)),
+    };
     let mut items = Vec::new();
-    for entry in dua_core::read_dir(path, Options::default())? {
+    for entry in entries {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -222,7 +237,7 @@ fn read_folder(path: &Path) -> io::Result<Vec<Item>> {
         };
         items.push(Item { name: entry.file_name, kind, meta });
     }
-    Ok(items)
+    Some(Ok(items))
 }
 
 struct Applier<'a> {
@@ -234,7 +249,12 @@ struct Applier<'a> {
 impl Applier<'_> {
     /// Adds a folder's entries to the tree and returns the subfolders to read in `found`.
     fn apply(&mut self, tree: &mut Tree, listing: &Listing, found: &mut Vec<(NodeId, PathBuf)>) {
-        let Ok(items) = &listing.items else {
+        let Some(items) = &listing.items else {
+            // Abandoned: the folder still has to be read.
+            found.push((listing.dir, listing.path.clone()));
+            return;
+        };
+        let Ok(items) = items else {
             self.progress.errors.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -414,12 +434,24 @@ mod tests {
 
     #[test]
     fn a_stopped_scan_reports_the_folders_still_to_read() {
+        // Stopped before anything was read, nothing is applied and the root is still to read.
         let tmp = fixture();
         let root = tmp.path().canonicalize().unwrap();
         let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
         let stop = AtomicBool::new(true);
         let outcome = scan(&tree, &Boundary::new(&root), &Progress::default(), &stop, vec![ROOT], None, &mut CountedLinks::new());
-        assert!(matches!(outcome, Outcome::Paused(ref p) if !p.is_empty()), "{outcome:?}");
+        assert_eq!(outcome, Outcome::Paused(vec![ROOT]));
+        assert_eq!(tree.read().children(ROOT).count(), 0);
+    }
+
+    #[test]
+    fn stopping_abandons_a_folder_being_read() {
+        // Pausing must not wait until a folder with hundreds of thousands of items is read;
+        // the folder is reported unread instead of half-read.
+        let tmp = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(read_folder(&root, &AtomicBool::new(true)).is_none());
+        assert!(matches!(read_folder(&root, &AtomicBool::new(false)), Some(Ok(ref items)) if !items.is_empty()));
     }
 
     #[test]

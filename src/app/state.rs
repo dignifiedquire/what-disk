@@ -433,8 +433,10 @@ impl AppState {
     }
 
     /// Pauses a scan, or stops a folder rescan.
-    pub fn stop(self, session: &Session) {
+    pub fn stop(mut self, session: &Session) {
         session.stop.store(true, Ordering::Relaxed);
+        // Shows "Pausing…" at once; saving the results so far can take seconds.
+        self.rev.with_mut(|r| *r += 1);
     }
 
     /// Drops paths that were deleted on disk from every loaded scan that contains them, so

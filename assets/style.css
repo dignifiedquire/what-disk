@@ -256,6 +256,15 @@ input:focus-visible,
   opacity: 0.4;
 }
 
+.toolbar-button.labeled {
+  width: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px 0 8px;
+  font-size: 13px;
+}
+
 .search-field {
   display: flex;
   align-items: center;
