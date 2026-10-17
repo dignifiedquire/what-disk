@@ -1003,6 +1003,11 @@ input:focus-visible,
   background: rgba(59, 111, 182, 0.14);
 }
 
+.badge.swift {
+  color: #d0401f;
+  background: rgba(240, 81, 56, 0.14);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.rust {
     color: #ff8a50;
@@ -1027,6 +1032,11 @@ input:focus-visible,
   .badge.c {
     color: #7fb0ff;
     background: rgba(127, 176, 255, 0.16);
+  }
+
+  .badge.swift {
+    color: #ff7a5c;
+    background: rgba(255, 122, 92, 0.16);
   }
 }
 

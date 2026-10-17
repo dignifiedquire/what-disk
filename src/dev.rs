@@ -14,11 +14,18 @@ pub enum Language {
     Go,
     Java,
     C,
+    Swift,
 }
 
 impl Language {
-    pub const ALL: &[Language] =
-        &[Language::Rust, Language::JavaScript, Language::Go, Language::Java, Language::C];
+    pub const ALL: &[Language] = &[
+        Language::Rust,
+        Language::JavaScript,
+        Language::Go,
+        Language::Java,
+        Language::C,
+        Language::Swift,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -27,6 +34,7 @@ impl Language {
             Language::Go => "Go",
             Language::Java => "Java",
             Language::C => "C/C++",
+            Language::Swift => "Swift",
         }
     }
 
@@ -38,6 +46,7 @@ impl Language {
             Language::Go => "go",
             Language::Java => "java",
             Language::C => "c",
+            Language::Swift => "swift",
         }
     }
 }
@@ -59,6 +68,8 @@ pub enum ArtifactKind {
     CMakeBuild,
     /// A Meson build folder, whatever its name.
     MesonBuild,
+    /// Swift Package Manager's `.build/`.
+    SwiftPmBuild,
 }
 
 impl ArtifactKind {
@@ -70,6 +81,7 @@ impl ArtifactKind {
                 Language::Java
             }
             ArtifactKind::CMakeBuild | ArtifactKind::MesonBuild => Language::C,
+            ArtifactKind::SwiftPmBuild => Language::Swift,
         }
     }
 
@@ -82,6 +94,7 @@ impl ArtifactKind {
             ArtifactKind::GradleProjectCache => ".gradle",
             ArtifactKind::CMakeBuild => "CMake build",
             ArtifactKind::MesonBuild => "Meson build",
+            ArtifactKind::SwiftPmBuild => ".build",
         }
     }
 }
@@ -121,8 +134,8 @@ const SYSTEM_FOLDERS: &[&str] = &[
 /// Cargo tagged with `CACHEDIR.TAG`. A JavaScript project is a folder with `node_modules/`
 /// next to `package.json`. A Java project has Maven's `target/` next to `pom.xml`, or
 /// Gradle's `build/` and `.gradle/` next to a Gradle build or settings file. A C or C++ build
-/// folder is recognised by what CMake or Meson leaves in it, since it can have any name.
-/// Packages, hidden folders, `~/Library` and system folders are not
+/// folder is recognised by what CMake or Meson leaves in it, since it can have any name. A
+/// Swift package has `.build/` next to `Package.swift`. Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
 pub fn find_projects(tree: &Tree) -> Vec<Project> {
@@ -131,6 +144,7 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
     let mut stack = vec![ROOT];
     while let Some(dir) = stack.pop() {
         let (mut cargo_toml, mut package_json, mut pom_xml) = (false, false, false);
+        let (mut package_swift, mut swift_build) = (false, None);
         let (mut gradle_build, mut gradle_settings) = (false, false);
         let (mut cmake_cache, mut cmake_lists, mut meson_private, mut meson_build) =
             (false, false, false, false);
@@ -151,6 +165,8 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
                 b"node_modules" if is_dir => node_modules = Some(c),
                 b"build" if is_dir => build = Some(c),
                 b".gradle" if is_dir => dot_gradle = Some(c),
+                b"Package.swift" if !is_dir => package_swift = true,
+                b".build" if is_dir => swift_build = Some(c),
                 _ => {}
             }
         }
@@ -185,6 +201,7 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         found(node_modules, ArtifactKind::NodeModules, package_json);
         found(build, ArtifactKind::GradleBuild, gradle_build);
         found(dot_gradle, ArtifactKind::GradleProjectCache, gradle_build || gradle_settings);
+        found(swift_build, ArtifactKind::SwiftPmBuild, package_swift);
         for c in tree.children(dir) {
             let n = tree.node(c);
             let searchable = n.is_dir()
@@ -264,7 +281,11 @@ const GLOBAL_CACHES: &[(&str, Language, &str, &str)] = &[
     (".conan2/p", Language::C, "Conan packages", REDOWNLOADED),
     (".conan/data", Language::C, "Conan packages", REDOWNLOADED),
     (".cache/vcpkg/archives", Language::C, "vcpkg binary cache", REBUILT),
+    ("Library/Caches/org.swift.swiftpm", Language::Swift, "SwiftPM cache", REDOWNLOADED),
+    ("Library/Developer/CoreSimulator/Caches", Language::Swift, "Simulator caches", REBUILT),
 ];
+
+const DEVICE_SUPPORT: &str = "Copied again when the device connects";
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
 /// versions tend to pile up. Only subfolders whose name starts with the given prefix count.
@@ -284,7 +305,31 @@ const TOOLCHAINS: &[(&str, Language, &str, &str, &str)] = &[
         "Reinstall the JDK; removing it needs an administrator",
         "",
     ),
+    ("Library/Developer/Xcode/DerivedData", Language::Swift, "Xcode build data", REBUILT, ""),
+    ("Library/Developer/Xcode/iOS DeviceSupport", Language::Swift, "iOS device support", DEVICE_SUPPORT, ""),
+    (
+        "Library/Developer/Xcode/watchOS DeviceSupport",
+        Language::Swift,
+        "watchOS device support",
+        DEVICE_SUPPORT,
+        "",
+    ),
+    ("Library/Developer/Toolchains", Language::Swift, "Swift toolchain", "Reinstall from swift.org", ""),
+    (".swiftly/toolchains", Language::Swift, "Swift toolchain", "Reinstall with swiftly", ""),
 ];
+
+/// "MyApp-abcdefghijklmnopqrstuvwxyzab" -> "MyApp": Xcode appends 28 random letters to the
+/// project's folder in DerivedData.
+fn without_xcode_suffix(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((base, suffix))
+            if !base.is_empty() && suffix.len() == 28 && suffix.bytes().all(|b| b.is_ascii_lowercase()) =>
+        {
+            base
+        }
+        _ => name,
+    }
+}
 
 /// Global caches and installed toolchain versions of the user whose home folder is `home`,
 /// if this tree contains them. Default locations only: a GUI app does not see overrides such
@@ -306,7 +351,7 @@ pub fn find_global_caches(tree: &Tree, home: &Path) -> Vec<GlobalCache> {
                 GlobalCache {
                     id,
                     language,
-                    label: format!("{label} {}", tree.display_name(id)),
+                    label: format!("{label} {}", without_xcode_suffix(&tree.display_name(id))),
                     note,
                 }
             }));
@@ -624,6 +669,51 @@ mod tests {
             .map(|c| (c.id, c.label))
             .collect();
         assert_eq!(found, vec![(ccache, "ccache".into()), (packages, "Conan packages".into())]);
+    }
+
+    #[test]
+    fn swift_packages_are_found_by_their_build_folder() {
+        let mut t = Tree::new("/w".into(), "w", 0);
+        let pkg = dir(&mut t, ROOT, "pkg");
+        file(&mut t, pkg, "Package.swift", 1, 0);
+        t.add(pkg, b".build", Kind::Dir, flags::HIDDEN, 0, 0);
+        let other = dir(&mut t, ROOT, "other");
+        t.add(other, b".build", Kind::Dir, flags::HIDDEN, 0, 0);
+        assert_eq!(found(&t), vec![("/w/pkg".into(), vec![ArtifactKind::SwiftPmBuild])]);
+    }
+
+    #[test]
+    fn xcode_data_is_listed_per_project_and_device_version() {
+        // DerivedData and device support grow one folder per project or OS version; each is
+        // its own entry, named without Xcode's random suffix.
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let library = dir(&mut t, ROOT, "Library");
+        let developer = dir(&mut t, library, "Developer");
+        let xcode = dir(&mut t, developer, "Xcode");
+        let derived = dir(&mut t, xcode, "DerivedData");
+        let app = dir(&mut t, derived, "deltachat-ios-dgddllzyrnuofhchphksaujitkre");
+        let support = dir(&mut t, xcode, "iOS DeviceSupport");
+        let ios = dir(&mut t, support, "17.1 (21B80)");
+        let labels: Vec<(NodeId, String)> = find_global_caches(&t, Path::new("/Users/me"))
+            .into_iter()
+            .filter(|c| c.language == Language::Swift)
+            .map(|c| (c.id, c.label))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (app, "Xcode build data deltachat-ios".into()),
+                (ios, "iOS device support 17.1 (21B80)".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_xcodes_random_suffix_is_removed_from_names() {
+        assert_eq!(without_xcode_suffix("App-abcdefghijklmnopqrstuvwxyzab"), "App");
+        assert_eq!(without_xcode_suffix("nightly-2024-01-01-aarch64-apple-darwin"), "nightly-2024-01-01-aarch64-apple-darwin");
+        assert_eq!(without_xcode_suffix("App-ABCDEFGHIJKLMNOPQRSTUVWXYZAB"), "App-ABCDEFGHIJKLMNOPQRSTUVWXYZAB");
+        assert_eq!(without_xcode_suffix("-abcdefghijklmnopqrstuvwxyzab"), "-abcdefghijklmnopqrstuvwxyzab");
     }
 
     #[test]

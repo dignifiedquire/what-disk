@@ -15,14 +15,16 @@ interface that looks and behaves like a native Mac app.
 - **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
   location or a single folder when you want fresh numbers.
 - **Projects & Toolchains** lists the build folders of Rust (`target/`), JavaScript
-  (`node_modules/`), Java (Maven `target/`, Gradle `build/` and `.gradle/`) and C/C++
-  (CMake and Meson build folders) projects, plus toolchain caches and versions across all
-  saved scans:
+  (`node_modules/`), Java (Maven `target/`, Gradle `build/` and `.gradle/`), C/C++ (CMake
+  and Meson build folders) and Swift (`.build/`) projects, plus toolchain caches and
+  versions across all saved scans:
   - Rust: Cargo, rustup, kache, sccache
   - JavaScript: nvm, Deno, npm, pnpm, Yarn, Bun
   - Go: module cache, build cache, golangci-lint, SDKs in `~/sdk`
   - Java: Maven repository, Gradle caches and distributions, JDKs
   - C/C++: ccache, Conan, vcpkg
+  - Swift: Xcode DerivedData per project, device support per OS version, simulator and
+    SwiftPM caches, Swift toolchains
 - **Apps** lists applications and Homebrew packages with the space they and their data in
   `~/Library` use, and can uninstall them.
 
