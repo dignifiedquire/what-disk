@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use dioxus::prelude::*;
 use parking_lot::{Mutex, RwLock};
@@ -13,7 +13,7 @@ use crate::brew::{self, Brew};
 use crate::cache;
 use crate::dev::Language;
 use crate::locations::Locations;
-use crate::scan::{self, Outcome, Progress};
+use crate::scan::{self, CountedLinks, Outcome, Progress};
 use crate::tree::{NodeId, ROOT, Tree, flags};
 use crate::volumes::{self, Boundary, Volume};
 
@@ -31,10 +31,18 @@ pub struct Session {
     pub root: PathBuf,
     pub tree: RwLock<Tree>,
     pub progress: Progress,
-    pub cancel: AtomicBool,
+    /// Asks a running scan to pause, or a folder rescan to stop, after the folders it is
+    /// reading.
+    pub stop: AtomicBool,
     pub busy: Mutex<Busy>,
-    /// When the tree was last scanned completely; `None` if the last scan was stopped.
+    /// When the tree was last scanned completely; for an unfinished scan, when it started.
+    /// `None` before the first scan.
     pub scanned_at: Mutex<Option<SystemTime>>,
+    /// Folders a paused scan still has to read. Empty once the scan is complete, and while
+    /// a scan runs, since the scan holds them.
+    pub pending: Mutex<Vec<NodeId>>,
+    /// Hard links a paused scan has counted, so continuing it does not count them again.
+    pub counted: Mutex<CountedLinks>,
     /// Incremented by background threads whenever they finish changing the tree.
     pub version: AtomicU64,
 }
@@ -45,9 +53,11 @@ impl Session {
             root: root.to_path_buf(),
             tree: RwLock::new(Tree::new(root.to_path_buf(), name, 0)),
             progress: Progress::default(),
-            cancel: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
             busy: Mutex::new(Busy::Idle),
             scanned_at: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
+            counted: Mutex::new(CountedLinks::new()),
             version: AtomicU64::new(0),
         }
     }
@@ -56,16 +66,81 @@ impl Session {
         *self.busy.lock()
     }
 
+    pub fn is_paused(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// The tree holds a whole, finished scan.
+    pub fn is_complete(&self) -> bool {
+        self.busy() == Busy::Idle && self.scanned_at.lock().is_some() && !self.is_paused()
+    }
+
     fn finish(&self) {
         *self.busy.lock() = Busy::Idle;
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Writes the tree to the cache; failures only cost a rescan next time.
+    /// Writes the tree to the cache; failures only cost a rescan next time. Must not be
+    /// called by others while a scan runs: the scan holds the folders it still has to read,
+    /// so the cache would record the partial tree as complete.
     pub fn save(&self) {
         if let Some(at) = *self.scanned_at.lock() {
-            let _ = cache::save(&cache::dir(), &self.tree.read(), at);
+            let _ = cache::save(&cache::dir(), &self.tree.read(), at, &self.pending.lock(), &self.counted.lock());
         }
+    }
+}
+
+/// How often a running scan saves its progress, so quitting or a crash loses little.
+const CHECKPOINT: Duration = Duration::from_secs(120);
+
+/// Scans that are running. Quitting pauses and saves them; by then the window and its state
+/// are gone, so they are tracked here.
+static RUNNING: Mutex<Vec<Arc<Session>>> = Mutex::new(Vec::new());
+
+/// Scans `folders` of the session's tree in the background until it is complete or paused.
+fn spawn_scan(session: Arc<Session>, folders: Vec<NodeId>) {
+    *session.busy.lock() = Busy::Scanning;
+    RUNNING.lock().push(session.clone());
+    std::thread::spawn(move || {
+        let boundary = Boundary::new(&session.root);
+        let mut folders = folders;
+        let mut counted = std::mem::take(&mut *session.counted.lock());
+        loop {
+            let deadline = Some(Instant::now() + CHECKPOINT);
+            let outcome = scan::scan(&session.tree, &boundary, &session.progress, &session.stop, folders, deadline, &mut counted);
+            match outcome {
+                Outcome::Complete => {
+                    *session.scanned_at.lock() = Some(SystemTime::now());
+                    session.save();
+                    break;
+                }
+                Outcome::Paused(rest) => {
+                    *session.pending.lock() = rest;
+                    *session.counted.lock() = counted;
+                    session.save();
+                    if session.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    folders = std::mem::take(&mut *session.pending.lock());
+                    counted = std::mem::take(&mut *session.counted.lock());
+                }
+            }
+        }
+        session.stop.store(false, Ordering::Relaxed);
+        RUNNING.lock().retain(|s| !Arc::ptr_eq(s, &session));
+        session.finish();
+    });
+}
+
+/// Pauses running scans and waits up to `limit` for them to save, so they can continue at
+/// the next launch.
+pub fn pause_scans_before_quit(limit: Duration) {
+    let started = Instant::now();
+    for session in RUNNING.lock().iter() {
+        session.stop.store(true, Ordering::Relaxed);
+    }
+    while !RUNNING.lock().is_empty() && started.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -264,9 +339,14 @@ impl AppState {
         self.sessions.write().insert(root.clone(), session.clone());
         std::thread::spawn(move || {
             match cache::load(&cache::dir(), &root) {
-                Ok((tree, summary)) => {
+                Ok((tree, summary, pending, counted)) => {
+                    // A continued scan counts on from the items it already found.
+                    let found = tree.parts().0.len() as u64 - 1;
+                    session.progress.files.store(found, Ordering::Relaxed);
                     *session.tree.write() = tree;
                     *session.scanned_at.lock() = Some(summary.scanned_at);
+                    *session.pending.lock() = pending;
+                    *session.counted.lock() = counted;
                 }
                 // An unreadable cache is treated as "not scanned"; the next scan replaces it.
                 Err(_) => {
@@ -277,26 +357,36 @@ impl AppState {
         });
     }
 
-    /// Starts a full scan of `path`, replacing any previous result for it.
+    /// Starts a full scan of `path`, replacing any previous result for it. Does nothing while
+    /// `path` is being scanned: both scans would save to the same cache.
     pub fn start_scan(mut self, path: &Path) {
+        let running = self
+            .sessions
+            .peek()
+            .get(path)
+            .is_some_and(|s| matches!(s.busy(), Busy::Scanning | Busy::Rescanning(_)));
+        if running {
+            return;
+        }
         let name = self
             .location(path)
             .map_or_else(|| volumes::display_name(path), |l| l.name);
         let session = Arc::new(Session::new(path, &name));
-        *session.busy.lock() = Busy::Scanning;
-        if let Some(old) = self.sessions.write().insert(path.to_path_buf(), session.clone()) {
-            old.cancel.store(true, Ordering::Relaxed);
-        }
+        *session.scanned_at.lock() = Some(SystemTime::now());
+        self.sessions.write().insert(path.to_path_buf(), session.clone());
         self.view.set(View::default());
-        std::thread::spawn(move || {
-            let boundary = Arc::new(Boundary::new(&session.root));
-            let outcome = scan::scan(&session.tree, boundary, &session.progress, &session.cancel);
-            if outcome == Outcome::Complete {
-                *session.scanned_at.lock() = Some(SystemTime::now());
-                session.save();
-            }
-            session.finish();
-        });
+        spawn_scan(session, vec![ROOT]);
+    }
+
+    /// Continues a paused scan with the folders it has not read yet.
+    pub fn resume_scan(self, session: Arc<Session>) {
+        if session.busy() != Busy::Idle {
+            return;
+        }
+        let folders = std::mem::take(&mut *session.pending.lock());
+        if !folders.is_empty() {
+            spawn_scan(session, folders);
+        }
     }
 
     /// Rescans one folder of an existing scan and replaces its contents.
@@ -315,9 +405,18 @@ impl AppState {
         *session.busy.lock() = Busy::Rescanning(id);
         std::thread::spawn(move || {
             let sub = RwLock::new(Tree::new(path, &name, 0));
-            let boundary = Arc::new(Boundary::new(&session.root));
-            let outcome = scan::scan(&sub, boundary, &Progress::default(), &session.cancel);
-            session.cancel.store(false, Ordering::Relaxed);
+            let boundary = Boundary::new(&session.root);
+            let outcome = scan::scan(
+                &sub,
+                &boundary,
+                &Progress::default(),
+                &session.stop,
+                vec![ROOT],
+                None,
+                &mut CountedLinks::new(),
+            );
+            session.stop.store(false, Ordering::Relaxed);
+            // A stopped rescan keeps the folder's previous contents.
             if outcome == Outcome::Complete {
                 let sub = sub.into_inner();
                 let mut tree = session.tree.write();
@@ -325,18 +424,22 @@ impl AppState {
                     tree.graft(id, &sub);
                 }
                 drop(tree);
+                // In a paused scan the folder is now read; folders below it were replaced.
+                session.pending.lock().retain(|&p| p != id);
                 session.save();
             }
             session.finish();
         });
     }
 
+    /// Pauses a scan, or stops a folder rescan.
     pub fn stop(self, session: &Session) {
-        session.cancel.store(true, Ordering::Relaxed);
+        session.stop.store(true, Ordering::Relaxed);
     }
 
     /// Drops paths that were deleted on disk from every loaded scan that contains them, so
     /// overlapping scans (a volume and a folder on it) stay consistent, and saves those scans.
+    /// A running scan saves the change itself when it pauses or finishes.
     pub fn forget_paths(mut self, paths: &[PathBuf]) {
         let sessions: Vec<Arc<Session>> = self.sessions.peek().values().cloned().collect();
         for session in sessions {
@@ -352,7 +455,7 @@ impl AppState {
                 }
                 !ids.is_empty()
             };
-            if changed {
+            if changed && session.busy() != Busy::Scanning {
                 std::thread::spawn(move || {
                     session.save();
                     // Lets the sidebar pick up the new total from the saved scan.

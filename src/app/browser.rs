@@ -174,7 +174,7 @@ fn Columns(session: SessionRef, root: NodeId, selection: Vec<NodeId>) -> Element
     let _ = (state.rev)();
     let view = state.view.read().clone();
     let tree = session.tree.read();
-    let complete = session.busy() == Busy::Idle && session.scanned_at.lock().is_some();
+    let complete = session.is_complete();
     let unaccounted = (root == ROOT && complete)
         .then(|| state.volume_of(&session.root))
         .flatten()

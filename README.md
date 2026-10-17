@@ -14,6 +14,9 @@ interface that looks and behaves like a native Mac app.
   Items go to the Trash, or are deleted immediately after a confirmation.
 - **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
   location or a single folder when you want fresh numbers.
+- **Pause and resume** a scan from the toolbar. A running scan saves its progress every two
+  minutes and when you quit, so an unfinished scan continues where it stopped, even after a
+  restart.
 - **Projects & Toolchains** lists the build folders of Rust (`target/`), JavaScript
   (`node_modules/`), Java (Maven `target/`, Gradle `build/` and `.gradle/`), C/C++ (CMake
   and Meson build folders), Swift (`.build/`), Python (virtual environments, `.tox`,
@@ -71,12 +74,13 @@ folder only means the next start shows no previous scans.
 
 Debug builds read commands from standard input so the interface can be driven from
 scripts: each line is run as JavaScript in the page and its result is printed,
-`:open <path>` opens a folder, and `:locations` prints where the tools said they keep their
-data. Release builds do not include this.
+`:open <path>` opens a folder, `:locations` prints where the tools said they keep their
+data, and `:quit` and `:close` quit the app like ⌘Q and closing the window. Release builds
+do not include this.
 
 | Module | Purpose |
 | --- | --- |
-| `src/scan.rs` | Parallel scanning with `dua-core` |
+| `src/scan.rs` | Parallel, resumable scanning with `dua-core` |
 | `src/tree.rs` | Compact tree that holds a scan |
 | `src/cache.rs` | Saving and loading scans |
 | `src/volumes.rs` | Volumes and which folders a scan may enter |

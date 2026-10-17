@@ -61,6 +61,11 @@ pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
                 "Clear Selection"
             }
         },
+        Busy::Idle if session.is_paused() => rsx! {
+            span { class: "status-text secondary",
+                "Scan paused at {format::count(items)} items · {format::bytes(scanned)}"
+            }
+        },
         Busy::Idle => rsx! {
             span { class: "status-text secondary", "Check items to review and remove them." }
         },

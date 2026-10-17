@@ -32,6 +32,8 @@ pub use state::Session;
 
 const STYLE: &str = include_str!("../../assets/style.css");
 pub const APP_NAME: &str = "What Disk";
+/// How long quitting waits for running scans to save their progress.
+const QUIT_SAVE_LIMIT: Duration = Duration::from_secs(30);
 
 pub fn launch() {
     let window = WindowBuilder::new()
@@ -47,7 +49,14 @@ pub fn launch() {
         .with_menu(menu_bar())
         .with_background_color((0, 0, 0, 0))
         .with_disable_context_menu(!cfg!(debug_assertions))
-        .with_custom_head(format!("<style>{STYLE}</style>"));
+        .with_custom_head(format!("<style>{STYLE}</style>"))
+        // Quitting, from the menu or by closing the window, pauses running scans and saves
+        // them. The window and its state are gone by then, so a component cannot do this.
+        .with_custom_event_handler(|event, _| {
+            if let dioxus::desktop::tao::event::Event::LoopDestroyed = event {
+                state::pause_scans_before_quit(QUIT_SAVE_LIMIT);
+            }
+        });
     dioxus::LaunchBuilder::desktop().with_cfg(config).launch(App);
 }
 
@@ -357,7 +366,7 @@ fn App() -> Element {
 /// accessibility without extra permissions. Each line on stdin is evaluated as JavaScript in
 /// the page and its result printed to stdout; `:open <path>` adds and selects a folder, which
 /// otherwise needs the native open panel; `:locations` prints what the tools reported about
-/// where they keep their data.
+/// where they keep their data; `:quit` quits like ⌘Q and `:close` closes the window.
 #[cfg(debug_assertions)]
 fn use_debug_console(state: AppState) {
     use_future(move || async move {
@@ -373,6 +382,19 @@ fn use_debug_console(state: AppState) {
             if let Some(path) = line.strip_prefix(":open ") {
                 open_folder(state, PathBuf::from(path.trim()));
                 println!("ok");
+            } else if line.trim() == ":quit" {
+                // From the run loop, like the Quit menu item: terminating inside the event
+                // loop's callback deadlocks it.
+                let mtm = objc2::MainThreadMarker::new().expect("the console runs on the main thread");
+                let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+                let none: Option<&objc2::runtime::AnyObject> = None;
+                // SAFETY: performSelector:withObject:afterDelay: is an NSObject method, and
+                // terminate: takes one object argument, which may be nil.
+                let _: () = unsafe {
+                    objc2::msg_send![&app, performSelector: objc2::sel!(terminate:), withObject: none, afterDelay: 0.0f64]
+                };
+            } else if line.trim() == ":close" {
+                dioxus::desktop::window().close();
             } else if line.trim() == ":locations" {
                 let locations = state.tool_locations.peek().clone();
                 let mut reported: Vec<String> =

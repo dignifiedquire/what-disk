@@ -180,6 +180,11 @@ input:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.sidebar-paused {
+  display: flex;
+  color: var(--secondary);
+}
+
 .sidebar-add {
   margin-top: 6px;
   color: var(--secondary);

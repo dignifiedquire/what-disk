@@ -33,10 +33,12 @@ pub fn Toolbar() -> Element {
         ));
     }
     let busy = resolved.as_ref().map(|(s, _)| s.busy());
+    let paused = resolved.as_ref().is_some_and(|(s, _)| s.is_paused());
     if let Some((session, _)) = &resolved
         && busy == Some(Busy::Idle)
     {
         match *session.scanned_at.lock() {
+            _ if paused => subtitle.push("scan paused, results incomplete".into()),
             Some(at) => subtitle.push(format!("scanned {}", format::ago(at))),
             None => subtitle.push("scan stopped, results incomplete".into()),
         }
@@ -106,14 +108,30 @@ pub fn Toolbar() -> Element {
                 onmousedown: move |e| e.stop_propagation(),
                 ondoubleclick: move |e| e.stop_propagation(),
                 if let Some((session, _)) = resolved.clone() {
-                    if matches!(busy, Some(Busy::Scanning | Busy::Rescanning(_))) {
+                    if busy == Some(Busy::Scanning) {
                         button {
                             class: "toolbar-button",
-                            title: "Stop Scanning",
+                            title: "Pause Scanning",
+                            onclick: move |_| state.stop(&session),
+                            Symbol { icon: Icon::Pause }
+                        }
+                    } else if matches!(busy, Some(Busy::Rescanning(_))) {
+                        button {
+                            class: "toolbar-button",
+                            title: "Stop Rescanning",
                             onclick: move |_| state.stop(&session),
                             Symbol { icon: Icon::Stop }
                         }
                     } else {
+                        if paused {
+                            button {
+                                class: "toolbar-button",
+                                title: "Resume Scanning",
+                                disabled: busy != Some(Busy::Idle),
+                                onclick: move |_| state.resume_scan(session.clone()),
+                                Symbol { icon: Icon::Resume }
+                            }
+                        }
                         button {
                             class: "toolbar-button",
                             title: "Rescan (⌘R)",

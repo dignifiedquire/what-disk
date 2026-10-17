@@ -4,7 +4,7 @@ use std::f64::consts::TAU;
 
 use dioxus::prelude::*;
 
-use super::state::{Busy, use_app_state};
+use super::state::use_app_state;
 use super::{SessionRef, format};
 use crate::tree::{NodeId, ROOT, Tree};
 
@@ -113,7 +113,7 @@ pub fn Sunburst(
     let _ = (state.rev)();
     let mut hover = use_signal(|| None::<Hover>);
     let tree = session.tree.read();
-    let complete = session.busy() == Busy::Idle && session.scanned_at.lock().is_some();
+    let complete = session.is_complete();
     let unaccounted = (center == ROOT && complete)
         .then(|| state.volume_of(&session.root))
         .flatten()

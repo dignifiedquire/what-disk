@@ -90,7 +90,7 @@ fn SidebarItem(location: Location) -> Element {
         .read()
         .get(&location.path)
         .is_some_and(|s| matches!(s.busy(), Busy::Scanning | Busy::Loading));
-    let size = state.summaries.read().get(&location.path).map(|s| s.total);
+    let summary = state.summaries.read().get(&location.path).map(|s| (s.total, s.complete));
     let icon = icon_for(&location);
     let path = location.path.clone();
 
@@ -103,7 +103,10 @@ fn SidebarItem(location: Location) -> Element {
             span { class: "sidebar-name", "{location.name}" }
             if scanning {
                 span { class: "spinner" }
-            } else if let Some(size) = size {
+            } else if let Some((size, complete)) = summary {
+                if !complete {
+                    span { class: "sidebar-paused", title: "Scan paused", Symbol { icon: Icon::Pause, size: 12 } }
+                }
                 span { class: "sidebar-size", "{format::bytes(size)}" }
             }
         }

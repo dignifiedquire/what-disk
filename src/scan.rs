@@ -1,19 +1,26 @@
-//! Parallel scan of a directory into a [`Tree`].
+//! Parallel, resumable scan of a directory into a [`Tree`].
 //!
-//! `dua-core` walks the file system on many threads using `getattrlistbulk`, which returns
-//! names and sizes for a whole directory per system call. This module consumes its entries on
-//! one thread and adds them to the shared tree in batches, so the UI can show live totals.
+//! Worker threads read one folder at a time with `dua-core`'s native reader, which uses
+//! `getattrlistbulk` to return names and sizes for a whole folder per system call. One thread
+//! applies each folder's listing to the shared tree, so the UI can show live totals, and
+//! queues the subfolders it finds. Because a folder counts as read only once its listing is
+//! applied, a scan can stop at any time and later continue with exactly the folders that are
+//! still queued.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use dua_core::{Entry, Options, Order};
-use parking_lot::RwLock;
+use dua_core::Options;
+use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::tree::{Kind, NONE, NodeId, ROOT, Tree, flags};
+use crate::tree::{Kind, NodeId, ROOT, Tree, flags};
 use crate::volumes::Boundary;
 
 #[derive(Default)]
@@ -24,110 +31,164 @@ pub struct Progress {
     pub errors: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Complete,
-    Cancelled,
+    /// Stopped early. These folders were found but not read yet; scanning them continues
+    /// the scan.
+    Paused(Vec<NodeId>),
 }
 
-/// Entries applied per write lock, and the longest time entries wait before being applied.
-const BATCH: usize = 8192;
-const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+/// Hard links already counted, kept across pauses of one scan: (device, inode).
+pub type CountedLinks = HashSet<(u64, u64)>;
 
-/// Scans `tree.root_path()` into `tree`, which must contain only its root. `boundary` comes
-/// from the root of the whole scan, so a folder rescan follows the same volume rules.
+/// How long the applying thread waits for listings before checking whether to stop.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Reads the folders `folders` of `tree` and everything below them that `boundary` allows.
+/// Pass `vec![ROOT]` for a new scan, or a previous [`Outcome::Paused`] list to continue one.
+/// Stops when `stop` is set, or after `deadline` once at least one folder was read.
 pub fn scan(
     tree: &RwLock<Tree>,
-    boundary: Arc<Boundary>,
+    boundary: &Boundary,
     progress: &Progress,
-    cancel: &AtomicBool,
+    stop: &AtomicBool,
+    folders: Vec<NodeId>,
+    deadline: Option<Instant>,
+    counted: &mut CountedLinks,
 ) -> Outcome {
-    let root = tree.read().root_path().to_path_buf();
-    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let walk_boundary = Arc::clone(&boundary);
-    let mut walk = dua_core::walk(&root, threads, Order::ParentFirst, Options::default(), move |e| {
-        let dev_ok = matches!(&e.metadata, Some(Ok(m)) if walk_boundary.allows_device(m.dev()));
-        dev_ok && (e.depth == 0 || !walk_boundary.excludes(&e.parent_path, &e.file_name))
-    });
-
-    let mut builder = Builder {
-        boundary: &boundary,
-        progress,
-        dir_ids: Vec::new(),
-        inodes: HashSet::new(),
+    let jobs: Vec<(NodeId, PathBuf)> = {
+        let mut t = tree.write();
+        if folders.contains(&ROOT) && t.node(ROOT).first_child == crate::tree::NONE {
+            let mtime = std::fs::symlink_metadata(t.root_path()).ok().map_or(0, |m| mtime_of(&m));
+            t.set_mtime(ROOT, mtime);
+        }
+        // Folders removed while the scan was paused are not read.
+        folders.into_iter().filter(|&id| t.is_attached(id)).map(|id| (id, t.path(id))).collect()
     };
-    let mut pending: Vec<Entry> = Vec::with_capacity(BATCH);
-    loop {
-        let started = Instant::now();
-        let mut finished = false;
-        while pending.len() < BATCH && started.elapsed() < FLUSH_INTERVAL {
-            match walk.next_cancellable(cancel) {
-                Some(Ok(e)) => pending.push(e),
-                Some(Err(_)) => {
-                    progress.errors.fetch_add(1, Ordering::Relaxed);
-                }
-                None => {
-                    finished = true;
+    let queue = Mutex::new(Queue { jobs, busy: 0, closed: false });
+    let ready = Condvar::new();
+    let (tx, rx) = mpsc::channel::<Listing>();
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let mut applier = Applier { boundary, progress, counted };
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (queue, ready) = (&queue, &ready);
+            scope.spawn(move || work(queue, ready, tx));
+        }
+        drop(tx);
+
+        let mut applied_any = false;
+        loop {
+            {
+                let q = queue.lock();
+                if q.jobs.is_empty() && q.busy == 0 {
                     break;
                 }
             }
-        }
-        if !pending.is_empty() {
-            let mut t = tree.write();
-            for e in pending.drain(..) {
-                builder.apply(&mut t, e);
+            let past_deadline = deadline.is_some_and(|d| Instant::now() >= d) && applied_any;
+            if stop.load(Ordering::Relaxed) || past_deadline {
+                break;
             }
+            let Ok(first) = rx.recv_timeout(POLL) else {
+                continue;
+            };
+            let listings: Vec<Listing> = std::iter::once(first).chain(rx.try_iter()).collect();
+            let mut found = Vec::new();
+            {
+                let mut t = tree.write();
+                for listing in &listings {
+                    applier.apply(&mut t, listing, &mut found);
+                }
+            }
+            applied_any = true;
+            let mut q = queue.lock();
+            q.busy -= listings.len();
+            q.jobs.extend(found);
+            ready.notify_all();
         }
-        if finished {
-            break;
+        // Stop handing out folders. Workers finish the folder they are reading.
+        queue.lock().closed = true;
+        ready.notify_all();
+    });
+    // Every worker has finished: apply what they read last, so no read folder is lost.
+    let mut found = Vec::new();
+    {
+        let mut t = tree.write();
+        for listing in rx.try_iter() {
+            applier.apply(&mut t, &listing, &mut found);
         }
     }
-    if cancel.load(Ordering::Relaxed) {
-        Outcome::Cancelled
-    } else {
-        Outcome::Complete
+    let mut pending: Vec<NodeId> = queue.into_inner().jobs.into_iter().map(|(id, _)| id).collect();
+    pending.extend(found.into_iter().map(|(id, _)| id));
+    if pending.is_empty() { Outcome::Complete } else { Outcome::Paused(pending) }
+}
+
+struct Queue {
+    /// Folders found but not read yet.
+    jobs: Vec<(NodeId, PathBuf)>,
+    /// Folders taken by a worker whose listing is not applied yet.
+    busy: usize,
+    closed: bool,
+}
+
+struct Listing {
+    dir: NodeId,
+    path: PathBuf,
+    items: io::Result<Vec<Item>>,
+}
+
+struct Item {
+    name: OsString,
+    kind: Kind,
+    meta: Option<Meta>,
+}
+
+struct Meta {
+    /// Allocated bytes on disk.
+    size: u64,
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    mtime: u32,
+}
+
+fn mtime_of(m: &std::fs::Metadata) -> u32 {
+    u32::try_from(m.mtime().max(0)).unwrap_or(u32::MAX)
+}
+
+fn work(queue: &Mutex<Queue>, ready: &Condvar, tx: mpsc::Sender<Listing>) {
+    loop {
+        let (dir, path) = {
+            let mut q = queue.lock();
+            loop {
+                if q.closed {
+                    return;
+                }
+                if let Some(job) = q.jobs.pop() {
+                    q.busy += 1;
+                    break job;
+                }
+                ready.wait(&mut q);
+            }
+        };
+        let items = read_folder(&path);
+        if tx.send(Listing { dir, path, items }).is_err() {
+            return;
+        }
     }
 }
 
-struct Builder<'a> {
-    boundary: &'a Boundary,
-    progress: &'a Progress,
-    /// `dua_core::DirectoryId` index -> node id.
-    dir_ids: Vec<NodeId>,
-    /// (device, inode) of files with several hard links that were already counted.
-    inodes: HashSet<(u64, u64)>,
-}
-
-impl Builder<'_> {
-    fn apply(&mut self, tree: &mut Tree, e: Entry) {
-        let meta = match e.metadata {
-            Some(Ok(m)) => Some(m),
-            Some(Err(_)) => {
-                self.progress.errors.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-            None => None,
+/// One folder's entries with their metadata, from a single bulk read where possible.
+fn read_folder(path: &Path) -> io::Result<Vec<Item>> {
+    let mut items = Vec::new();
+    for entry in dua_core::read_dir(path, Options::default())? {
+        let Ok(entry) = entry else {
+            continue;
         };
-        let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs() as u32);
-
-        let Some(parent_dir) = e.parent_directory_id else {
-            // The walk root.
-            self.map_dir(e.directory_id, ROOT);
-            tree.set_mtime(ROOT, mtime);
-            return;
-        };
-        if self.boundary.excludes(&e.parent_path, &e.file_name) {
-            return;
-        }
-        // Order::ParentFirst guarantees the parent was applied before its children.
-        let parent = self.dir_ids[parent_dir.index()];
-        debug_assert_ne!(parent, NONE);
-
-        let ft = e.file_type;
+        let ft = entry.file_type;
         let kind = if ft.is_dir() {
             Kind::Dir
         } else if ft.is_file() {
@@ -137,44 +198,80 @@ impl Builder<'_> {
         } else {
             Kind::Other
         };
-        let name = e.file_name.as_bytes();
-        let mut node_flags = 0;
-        if name.first() == Some(&b'.') {
-            node_flags |= flags::HIDDEN;
-        }
-        if kind == Kind::Dir && is_package(name) {
-            node_flags |= flags::PACKAGE;
-        }
-        let mut size = meta.as_ref().map_or(0, |m| m.allocated_size());
-        if let Some(m) = &meta {
-            if kind == Kind::File && m.nlink() > 1 && !self.inodes.insert((m.dev(), m.ino())) {
+        let meta = match &entry.metadata {
+            Some(Ok(m)) => Some(Meta {
+                size: m.allocated_size(),
+                dev: m.dev(),
+                ino: m.ino(),
+                // Only files need it; for folders it would cost another system call.
+                nlink: if kind == Kind::File { m.nlink() } else { 1 },
+                mtime: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as u32),
+            }),
+            // The bulk read did not include metadata for this entry; ask for it directly.
+            _ => std::fs::symlink_metadata(path.join(&entry.file_name)).ok().map(|m| Meta {
+                size: m.blocks() * 512,
+                dev: m.dev(),
+                ino: m.ino(),
+                nlink: m.nlink(),
+                mtime: mtime_of(&m),
+            }),
+        };
+        items.push(Item { name: entry.file_name, kind, meta });
+    }
+    Ok(items)
+}
+
+struct Applier<'a> {
+    boundary: &'a Boundary,
+    progress: &'a Progress,
+    counted: &'a mut CountedLinks,
+}
+
+impl Applier<'_> {
+    /// Adds a folder's entries to the tree and returns the subfolders to read in `found`.
+    fn apply(&mut self, tree: &mut Tree, listing: &Listing, found: &mut Vec<(NodeId, PathBuf)>) {
+        let Ok(items) = &listing.items else {
+            self.progress.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        for item in items {
+            if self.boundary.excludes(&listing.path, &item.name) {
+                continue;
+            }
+            let name = item.name.as_bytes();
+            let mut node_flags = 0;
+            if name.first() == Some(&b'.') {
+                node_flags |= flags::HIDDEN;
+            }
+            if item.kind == Kind::Dir && is_package(name) {
+                node_flags |= flags::PACKAGE;
+            }
+            let Some(meta) = &item.meta else {
+                self.progress.errors.fetch_add(1, Ordering::Relaxed);
+                tree.add(listing.dir, name, item.kind, node_flags, 0, 0);
+                continue;
+            };
+            let mut size = meta.size;
+            if item.kind == Kind::File && meta.nlink > 1 && !self.counted.insert((meta.dev, meta.ino)) {
                 size = 0;
                 node_flags |= flags::HARDLINK;
             }
-            if kind == Kind::Dir && !self.boundary.allows_device(m.dev()) {
+            let descend = item.kind == Kind::Dir && self.boundary.allows_device(meta.dev);
+            if item.kind == Kind::Dir && !descend {
                 // A mount point of another volume; its contents belong to that volume.
                 size = 0;
                 node_flags |= flags::PRUNED;
             }
-        }
-
-        let id = tree.add(parent, name, kind, node_flags, size, mtime);
-        self.map_dir(e.directory_id, id);
-        let counter = if kind == Kind::Dir {
-            &self.progress.dirs
-        } else {
-            &self.progress.files
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn map_dir(&mut self, dir: Option<dua_core::DirectoryId>, id: NodeId) {
-        if let Some(d) = dir {
-            let i = d.index();
-            if i >= self.dir_ids.len() {
-                self.dir_ids.resize(i + 1, NONE);
+            let id = tree.add(listing.dir, name, item.kind, node_flags, size, meta.mtime);
+            if descend {
+                found.push((id, listing.path.join(&item.name)));
             }
-            self.dir_ids[i] = id;
+            let counter = if item.kind == Kind::Dir { &self.progress.dirs } else { &self.progress.files };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -202,15 +299,39 @@ fn is_package(name: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::{Path, PathBuf};
 
     fn scan_dir(dir: &Path) -> Tree {
         let tree = RwLock::new(Tree::new(dir.to_path_buf(), "root", 0));
-        let boundary = Arc::new(Boundary::new(dir));
-        let outcome = scan(&tree, boundary, &Progress::default(), &AtomicBool::new(false));
+        let boundary = Boundary::new(dir);
+        let stop = AtomicBool::new(false);
+        let outcome = scan(&tree, &boundary, &Progress::default(), &stop, vec![ROOT], None, &mut CountedLinks::new());
         assert_eq!(outcome, Outcome::Complete);
         tree.into_inner()
+    }
+
+    /// Every path below the root with its size, for comparing two scans.
+    fn listing(t: &Tree) -> Vec<(PathBuf, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![ROOT];
+        while let Some(id) = stack.pop() {
+            out.push((t.path(id), t.size(id)));
+            stack.extend(t.children(id));
+        }
+        out.sort();
+        out
+    }
+
+    fn fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for a in 0..6 {
+            for b in 0..5 {
+                write(&root.join(format!("d{a}/e{b}/file.bin")), 1000 * (a + 1) * (b + 1));
+                write(&root.join(format!("d{a}/e{b}/sub/deeper/x.txt")), 10);
+            }
+        }
+        std::fs::hard_link(root.join("d0/e0/file.bin"), root.join("d5/link.bin")).unwrap();
+        tmp
     }
 
     fn allocated(p: &Path) -> u64 {
@@ -292,14 +413,66 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_scan_reports_cancelled() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn a_stopped_scan_reports_the_folders_still_to_read() {
+        let tmp = fixture();
         let root = tmp.path().canonicalize().unwrap();
-        write(&root.join("a/b"), 10);
         let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
-        let boundary = Arc::new(Boundary::new(&root));
-        let outcome = scan(&tree, boundary, &Progress::default(), &AtomicBool::new(true));
-        assert_eq!(outcome, Outcome::Cancelled);
+        let stop = AtomicBool::new(true);
+        let outcome = scan(&tree, &Boundary::new(&root), &Progress::default(), &stop, vec![ROOT], None, &mut CountedLinks::new());
+        assert!(matches!(outcome, Outcome::Paused(ref p) if !p.is_empty()), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_scan_paused_many_times_ends_exactly_like_one_uninterrupted_scan() {
+        // Quitting or pausing must never lose or double-count anything: every folder is
+        // either read and applied, or handed back to be read later.
+        let tmp = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        let whole = scan_dir(&root);
+
+        let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
+        let boundary = Boundary::new(&root);
+        let stop = AtomicBool::new(false);
+        let mut counted = CountedLinks::new();
+        let mut folders = vec![ROOT];
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            // A deadline in the past pauses after the first listings are applied in each round.
+            match scan(&tree, &boundary, &Progress::default(), &stop, folders, Some(Instant::now()), &mut counted) {
+                Outcome::Complete => break,
+                Outcome::Paused(rest) => folders = rest,
+            }
+            assert!(rounds < 1000, "no progress");
+        }
+        // Workers read ahead until the queue closes, but a round still gets at most two
+        // levels deeper, and the fixture is five levels deep.
+        assert!(rounds >= 3, "the scan should have been paused several times, took {rounds}");
+        let resumed = tree.into_inner();
+        assert_eq!(listing(&resumed), listing(&whole));
+        assert_eq!(resumed.size(ROOT), whole.size(ROOT));
+    }
+
+    #[test]
+    fn folders_removed_while_paused_are_skipped() {
+        let tmp = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
+        let boundary = Boundary::new(&root);
+        let stop = AtomicBool::new(false);
+        let mut counted = CountedLinks::new();
+        let Outcome::Paused(pending) =
+            scan(&tree, &boundary, &Progress::default(), &stop, vec![ROOT], Some(Instant::now()), &mut counted)
+        else {
+            panic!("expected a pause");
+        };
+        let gone = pending[0];
+        tree.write().remove(gone);
+        let mut folders = pending;
+        while let Outcome::Paused(rest) = scan(&tree, &boundary, &Progress::default(), &stop, folders, None, &mut counted) {
+            folders = rest;
+        }
+        assert!(!tree.read().is_attached(gone));
     }
 
     #[test]
