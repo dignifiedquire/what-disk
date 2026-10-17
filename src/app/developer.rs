@@ -53,11 +53,8 @@ pub fn collect(mut sessions: Vec<Arc<Session>>, locations: &Locations) -> Vec<De
                 let path = tree.path(a.id);
                 // The folder's own name, with what it is when the name does not say.
                 let name = tree.display_name(a.id);
-                let what = if name == a.kind.folder_name() {
-                    name.into_owned()
-                } else {
-                    format!("{name} · {}", a.kind.folder_name())
-                };
+                let kind = a.kind.folder_name();
+                let what = if kind.ends_with(name.as_ref()) { kind.to_string() } else { format!("{name} · {kind}") };
                 if seen.insert(path.clone()) {
                     rows.push(DevRow {
                         path,

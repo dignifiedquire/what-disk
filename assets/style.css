@@ -1013,6 +1013,11 @@ input:focus-visible,
   background: rgba(122, 79, 201, 0.14);
 }
 
+.badge.ruby {
+  color: #b5241c;
+  background: rgba(204, 52, 45, 0.13);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.rust {
     color: #ff8a50;
@@ -1047,6 +1052,11 @@ input:focus-visible,
   .badge.python {
     color: #b79bff;
     background: rgba(183, 155, 255, 0.16);
+  }
+
+  .badge.ruby {
+    color: #ff8a84;
+    background: rgba(255, 138, 132, 0.16);
   }
 }
 

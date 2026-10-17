@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::locations::{Locations, Root};
 use crate::tree::{NodeId, ROOT, Tree, flags};
-use Language::{C, Go, Java, JavaScript as Js, Python, Rust, Swift};
+use Language::{C, Go, Java, JavaScript as Js, Python, Ruby, Rust, Swift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -18,6 +18,7 @@ pub enum Language {
     C,
     Swift,
     Python,
+    Ruby,
 }
 
 impl Language {
@@ -29,6 +30,7 @@ impl Language {
         Language::C,
         Language::Swift,
         Language::Python,
+        Language::Ruby,
     ];
 
     pub fn label(self) -> &'static str {
@@ -40,6 +42,7 @@ impl Language {
             Language::C => "C/C++",
             Language::Swift => "Swift",
             Language::Python => "Python",
+            Language::Ruby => "Ruby",
         }
     }
 
@@ -53,6 +56,7 @@ impl Language {
             Language::C => "c",
             Language::Swift => "swift",
             Language::Python => "python",
+            Language::Ruby => "ruby",
         }
     }
 }
@@ -88,6 +92,10 @@ pub enum ArtifactKind {
     RuffCache,
     /// pytest's `.pytest_cache/`.
     PytestCache,
+    /// Gems that Bundler installed into the project, `vendor/bundle/`.
+    VendorBundle,
+    /// Rails' `tmp/cache/`.
+    RailsCache,
 }
 
 impl ArtifactKind {
@@ -106,6 +114,7 @@ impl ArtifactKind {
             | ArtifactKind::MypyCache
             | ArtifactKind::RuffCache
             | ArtifactKind::PytestCache => Language::Python,
+            ArtifactKind::VendorBundle | ArtifactKind::RailsCache => Language::Ruby,
         }
     }
 
@@ -125,6 +134,8 @@ impl ArtifactKind {
             ArtifactKind::MypyCache => ".mypy_cache",
             ArtifactKind::RuffCache => ".ruff_cache",
             ArtifactKind::PytestCache => ".pytest_cache",
+            ArtifactKind::VendorBundle => "vendor/bundle",
+            ArtifactKind::RailsCache => "tmp/cache",
         }
     }
 }
@@ -167,7 +178,8 @@ const SYSTEM_FOLDERS: &[&str] = &[
 /// folder is recognised by what CMake or Meson leaves in it, since it can have any name. A
 /// Swift package has `.build/` next to `Package.swift`. A Python virtual environment is a
 /// folder with a `pyvenv.cfg`, whatever its name; tox and Nox folders sit next to their
-/// configuration, and the mypy, Ruff and pytest caches carry a `CACHEDIR.TAG`. Packages, hidden folders, `~/Library` and system folders are not
+/// configuration, and the mypy, Ruff and pytest caches carry a `CACHEDIR.TAG`. A Ruby
+/// project has `vendor/bundle/` or `tmp/cache/` next to its `Gemfile`. Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
 pub fn find_projects(tree: &Tree) -> Vec<Project> {
@@ -183,6 +195,7 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         let (mut target, mut node_modules, mut build, mut dot_gradle) = (None, None, None, None);
         let (mut pyvenv_cfg, mut tox_config, mut noxfile) = (false, false, false);
         let (mut tox, mut nox, mut mypy, mut ruff, mut pytest) = (None, None, None, None, None);
+        let (mut gemfile, mut vendor, mut tmp) = (false, None, None);
         for c in tree.children(dir) {
             let is_dir = tree.node(c).is_dir();
             match tree.name(c).as_bytes() {
@@ -209,6 +222,9 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
                 b".mypy_cache" if is_dir => mypy = Some(c),
                 b".ruff_cache" if is_dir => ruff = Some(c),
                 b".pytest_cache" if is_dir => pytest = Some(c),
+                b"Gemfile" if !is_dir => gemfile = true,
+                b"vendor" if is_dir => vendor = Some(c),
+                b"tmp" if is_dir => tmp = Some(c),
                 _ => {}
             }
         }
@@ -252,6 +268,12 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         found(mypy, ArtifactKind::MypyCache, tagged(mypy));
         found(ruff, ArtifactKind::RuffCache, tagged(ruff));
         found(pytest, ArtifactKind::PytestCache, tagged(pytest));
+        let child_dir = |parent: Option<NodeId>, name: &[u8]| {
+            parent.and_then(|p| tree.children(p).find(|&c| tree.node(c).is_dir() && tree.name(c).as_bytes() == name))
+        };
+        // vendor/cache is meant to be committed, and the rest of tmp/ holds secrets and pids.
+        found(child_dir(vendor, b"bundle"), ArtifactKind::VendorBundle, gemfile);
+        found(child_dir(tmp, b"cache"), ArtifactKind::RailsCache, gemfile);
         // Hidden folders are not searched, so a `.venv` is recognised from here.
         for c in tree.children(dir) {
             let n = tree.node(c);
@@ -365,6 +387,12 @@ const GLOBAL_CACHES: &[(Root, &str, Language, &str, &str)] = &[
     (Root::PdmCache, "", Python, "PDM cache", REDOWNLOADED),
     (Root::HatchCache, "", Python, "Hatch cache", REDOWNLOADED),
     (Root::PyenvRoot, "cache", Python, "pyenv downloads", REDOWNLOADED),
+    (Root::Home, ".gem/specs", Ruby, "RubyGems cache", REDOWNLOADED),
+    (Root::Home, ".cache/gem", Ruby, "RubyGems cache", REDOWNLOADED),
+    (Root::BundleCache, "", Ruby, "Bundler cache", REDOWNLOADED),
+    (Root::RbenvRoot, "cache", Ruby, "ruby-build downloads", REDOWNLOADED),
+    (Root::RvmDir, "archives", Ruby, "rvm downloads", REDOWNLOADED),
+    (Root::RvmDir, "src", Ruby, "rvm sources", REDOWNLOADED),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
@@ -402,7 +430,29 @@ const TOOLCHAINS: &[(Root, &str, Language, &str, &str, &str)] = &[
     (Root::PoetryCache, "virtualenvs", Python, "Poetry environment", "Recreated by poetry install", ""),
     (Root::PipenvVenvs, "", Python, "Pipenv environment", "Recreated by pipenv install", ""),
     (Root::HatchData, "env/virtual", Python, "Hatch environments", "Recreated by Hatch", ""),
+    (Root::GemUser, "", Ruby, "Gems for Ruby", "Reinstall with bundle install", ""),
+    (Root::RbenvRoot, "versions", Ruby, "Ruby (rbenv)", "Reinstall with rbenv install", ""),
+    (Root::RvmDir, "rubies", Ruby, "Ruby (rvm)", "Reinstall with rvm install", ""),
+    (Root::Home, ".rubies", Ruby, "Ruby (ruby-install)", "Reinstall with ruby-install", ""),
+    // ruby-install unpacks sources into ~/src, which often holds the user's own code.
+    (Root::Home, "src", Ruby, "ruby-install sources", REDOWNLOADED, "ruby-"),
 ];
+
+/// Version managers for many languages: their installs, and which language each plugin is.
+const VERSION_MANAGERS: &[(Root, &str, &str)] = &[(Root::AsdfData, "installs", "asdf"), (Root::MiseData, "installs", "mise")];
+
+fn plugin_language(plugin: &str) -> Option<Language> {
+    Some(match plugin {
+        "node" | "nodejs" => Js,
+        "python" => Python,
+        "ruby" => Ruby,
+        "rust" => Rust,
+        "go" | "golang" => Go,
+        "java" => Java,
+        "swift" => Swift,
+        _ => return None,
+    })
+}
 
 /// "MyApp-abcdefghijklmnopqrstuvwxyzab" -> "MyApp": Xcode appends 28 random letters to the
 /// project's folder in DerivedData.
@@ -442,6 +492,22 @@ pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache
         for id in versions {
             let name = without_xcode_suffix(&tree.display_name(id)).to_string();
             add(GlobalCache { id, language, label: format!("{label} {name}"), note });
+        }
+    }
+    for &(root, rel, manager) in VERSION_MANAGERS {
+        let Some(installs) = tree.find(&locations.path(root, rel)) else {
+            continue;
+        };
+        for plugin in tree.children(installs).filter(|&c| tree.node(c).is_dir()) {
+            let name = tree.display_name(plugin);
+            let Some(language) = plugin_language(&name) else {
+                continue;
+            };
+            // Version aliases such as "3" are symbolic links and are skipped here.
+            for id in tree.children(plugin).filter(|&c| tree.node(c).is_dir()) {
+                let label = format!("{} {} ({manager})", language.label(), tree.display_name(id));
+                add(GlobalCache { id, language, label, note: "Reinstall with the version manager" });
+            }
         }
     }
     out
@@ -888,6 +954,67 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn ruby_folders_need_a_gemfile_and_only_the_regenerable_parts_count() {
+        // vendor/cache is committed on purpose, and tmp/ also holds the development secret,
+        // so only vendor/bundle and tmp/cache are offered.
+        let mut t = Tree::new("/w".into(), "w", 0);
+        let app = dir(&mut t, ROOT, "app");
+        file(&mut t, app, "Gemfile", 1, 0);
+        let vendor = dir(&mut t, app, "vendor");
+        dir(&mut t, vendor, "bundle");
+        dir(&mut t, vendor, "cache");
+        let tmp = dir(&mut t, app, "tmp");
+        dir(&mut t, tmp, "cache");
+        file(&mut t, tmp, "local_secret.txt", 1, 0);
+        let other = dir(&mut t, ROOT, "other");
+        let other_vendor = dir(&mut t, other, "vendor");
+        dir(&mut t, other_vendor, "bundle");
+        let mut paths: Vec<(PathBuf, ArtifactKind)> = find_projects(&t)
+            .into_iter()
+            .flat_map(|p| p.artifacts.into_iter().map(|a| (t.path(a.id), a.kind)).collect::<Vec<_>>())
+            .collect();
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            paths,
+            vec![
+                ("/w/app/tmp/cache".into(), ArtifactKind::RailsCache),
+                ("/w/app/vendor/bundle".into(), ArtifactKind::VendorBundle),
+            ]
+        );
+    }
+
+    #[test]
+    fn ruby_versions_and_version_manager_installs_are_listed_by_language() {
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let rbenv = t.add(ROOT, b".rbenv", Kind::Dir, flags::HIDDEN, 0, 0);
+        let versions = dir(&mut t, rbenv, "versions");
+        let ruby33 = dir(&mut t, versions, "3.3.0");
+        let src = dir(&mut t, ROOT, "src");
+        let ruby_src = dir(&mut t, src, "ruby-3.3.0");
+        dir(&mut t, src, "my-project");
+        let local = t.add(ROOT, b".local", Kind::Dir, flags::HIDDEN, 0, 0);
+        let share = dir(&mut t, local, "share");
+        let mise = dir(&mut t, share, "mise");
+        let installs = dir(&mut t, mise, "installs");
+        let node = dir(&mut t, installs, "node");
+        let node22 = dir(&mut t, node, "22.1.0");
+        t.add(node, b"22", Kind::Symlink, 0, 0, 0);
+        let erlang = dir(&mut t, installs, "erlang");
+        dir(&mut t, erlang, "27.0");
+
+        let found: Vec<(NodeId, Language, String)> =
+            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+                .into_iter()
+                .map(|c| (c.id, c.language, c.label))
+                .collect();
+        assert!(found.contains(&(ruby33, Language::Ruby, "Ruby (rbenv) 3.3.0".into())));
+        assert!(found.contains(&(ruby_src, Language::Ruby, "ruby-install sources ruby-3.3.0".into())));
+        assert!(found.contains(&(node22, Language::JavaScript, "JavaScript 22.1.0 (mise)".into())));
+        // The user's own project in ~/src and languages without a section are not listed.
+        assert_eq!(found.len(), 3);
     }
 
     #[test]

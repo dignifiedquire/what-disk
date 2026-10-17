@@ -16,9 +16,9 @@ interface that looks and behaves like a native Mac app.
   location or a single folder when you want fresh numbers.
 - **Projects & Toolchains** lists the build folders of Rust (`target/`), JavaScript
   (`node_modules/`), Java (Maven `target/`, Gradle `build/` and `.gradle/`), C/C++ (CMake
-  and Meson build folders), Swift (`.build/`) and Python (virtual environments, `.tox`,
-  `.nox` and tool caches) projects, plus toolchain caches and versions across all saved
-  scans:
+  and Meson build folders), Swift (`.build/`), Python (virtual environments, `.tox`,
+  `.nox` and tool caches) and Ruby (`vendor/bundle`, `tmp/cache`) projects, plus toolchain
+  caches and versions across all saved scans:
   - Rust: Cargo, rustup, kache, sccache
   - JavaScript: nvm, Deno, npm, pnpm, Yarn, Bun
   - Go: module cache, build cache, golangci-lint, SDKs in `~/sdk`
@@ -28,6 +28,9 @@ interface that looks and behaves like a native Mac app.
     SwiftPM caches, Swift toolchains
   - Python: pip, uv, pipx, Poetry, Pipenv, PDM and Hatch caches; Pythons from uv and
     pyenv; Poetry, Pipenv and Hatch environments
+  - Ruby: gems per Ruby version, RubyGems and Bundler caches, Rubies from rbenv, rvm and
+    ruby-install
+  - asdf and mise installs, filed under their language
 
   Locations come from each tool's documentation, adjusted by your shell environment (for
   example `CARGO_HOME` or `XDG_CACHE_HOME` set in `.zshrc`) and by asking installed tools

@@ -55,6 +55,13 @@ pub enum Root {
     HatchCache,
     HatchData,
     PyenvRoot,
+    /// The folder holding one gem folder per Ruby version, such as ~/.gem/ruby.
+    GemUser,
+    BundleCache,
+    RbenvRoot,
+    RvmDir,
+    AsdfData,
+    MiseData,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -87,6 +94,8 @@ const QUERIES: &[Query] = &[
     (Root::UvPython, "uv", &["python", "dir"], first_line),
     (Root::PoetryCache, "poetry", &["config", "cache-dir"], first_line),
     (Root::PyenvRoot, "pyenv", &["root"], first_line),
+    (Root::GemUser, "gem", &["env", "user_gemhome"], parent_of_first_line),
+    (Root::RbenvRoot, "rbenv", &["root"], first_line),
 ];
 
 impl Locations {
@@ -236,6 +245,23 @@ impl Locations {
                 .or_else(|| self.xdg("XDG_DATA_HOME", "hatch"))
                 .unwrap_or_else(|| home("Library/Application Support/hatch")),
             Root::PyenvRoot => var("PYENV_ROOT").unwrap_or_else(|| home(".pyenv")),
+            // RubyGems keeps using ~/.gem if it exists, else the XDG data folder.
+            Root::GemUser => {
+                if home(".gem").is_dir() {
+                    home(".gem/ruby")
+                } else {
+                    self.xdg("XDG_DATA_HOME", "gem/ruby").unwrap_or_else(|| home(".local/share/gem/ruby"))
+                }
+            }
+            Root::BundleCache => var("BUNDLE_USER_CACHE")
+                .or_else(|| var("BUNDLE_USER_HOME").map(|p| p.join("cache")))
+                .unwrap_or_else(|| home(".bundle/cache")),
+            Root::RbenvRoot => var("RBENV_ROOT").unwrap_or_else(|| home(".rbenv")),
+            Root::RvmDir => var("rvm_path").unwrap_or_else(|| home(".rvm")),
+            Root::AsdfData => var("ASDF_DATA_DIR").unwrap_or_else(|| home(".asdf")),
+            Root::MiseData => var("MISE_DATA_DIR")
+                .or_else(|| self.xdg("XDG_DATA_HOME", "mise"))
+                .unwrap_or_else(|| home(".local/share/mise")),
         }
     }
 
@@ -259,6 +285,11 @@ fn maven_repository(home: &Path) -> Option<PathBuf> {
 fn first_line(output: &str) -> Option<PathBuf> {
     let path = PathBuf::from(output.lines().map(str::trim).find(|l| !l.is_empty())?);
     path.is_absolute().then_some(path)
+}
+
+/// `gem env user_gemhome` names one Ruby version's folder; the root holds all of them.
+fn parent_of_first_line(output: &str) -> Option<PathBuf> {
+    first_line(output)?.parent().map(Path::to_path_buf)
 }
 
 fn deno_dir(output: &str) -> Option<PathBuf> {
