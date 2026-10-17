@@ -16,11 +16,12 @@
 //! written is dropped when the file is opened. Rescanning a folder writes a shadow copy and
 //! grafts it in when complete, so the old contents stay visible until then.
 
+use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Reverse;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -29,9 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
-pub type ItemId = u32;
+pub type NodeId = u32;
 pub type DirId = u32;
-pub const ROOT: ItemId = 0;
+pub const ROOT: NodeId = 0;
 pub const NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,8 +126,9 @@ const HEADER_LEN: u64 = 4096;
 /// Raw bytes collected before a block is compressed and written.
 const BLOCK: usize = 64 * 1024;
 /// A listing's location: the block's file offset in the high bits, the record's offset in
-/// the uncompressed block in the low bits.
-const IN_BLOCK_BITS: u32 = 24;
+/// the uncompressed block in the low bits. Normally a record starts in the first 64 KB of
+/// its block, but while the disk is full blocks keep growing in memory.
+const IN_BLOCK_BITS: u32 = 32;
 const UNLISTED: u64 = u64::MAX;
 /// Bytes of uncompressed blocks kept in memory.
 const BLOCK_CACHE: usize = 16 << 20;
@@ -147,8 +149,8 @@ struct Dir {
     /// `NONE` for the root and for folders replaced by a graft.
     parent: DirId,
     /// Its number. Increases with the folder number, so folders are found by item.
-    item: ItemId,
-    first_item: ItemId,
+    item: NodeId,
+    first_item: NodeId,
     count: u32,
     /// The folder's own allocated size.
     own: u32,
@@ -161,10 +163,10 @@ struct State {
     dirs: Vec<Dir>,
     names: Vec<u8>,
     /// (first item, folder) of every listing in the order written, so sorted by item.
-    listings: Vec<(ItemId, DirId)>,
-    next_item: ItemId,
+    listings: Vec<(NodeId, DirId)>,
+    next_item: NodeId,
     /// Items the user deleted.
-    removed: HashSet<ItemId>,
+    removed: HashSet<NodeId>,
     /// Files with several hard links that are already counted: (device, inode).
     counted: HashSet<(u64, u64)>,
     /// Rescans in progress: shadow folder -> the folder it replaces.
@@ -188,11 +190,15 @@ impl State {
 }
 
 struct Writer {
-    file: File,
+    /// `None` for a placeholder, which is never written.
+    file: Option<File>,
     /// File offset where the next block goes.
     end: u64,
     buf: Vec<u8>,
     header: Header,
+    /// Why the last block could not be written, typically a full disk. Records then stay in
+    /// memory, readable, until a write succeeds.
+    failed: Option<String>,
 }
 
 #[derive(Clone)]
@@ -219,7 +225,7 @@ struct Entry {
 
 /// A folder's entries, decoded.
 pub struct Listing {
-    first_item: ItemId,
+    first_item: NodeId,
     entries: Vec<Entry>,
     names: Vec<u8>,
 }
@@ -238,18 +244,43 @@ struct Cache<V> {
     order: VecDeque<u64>,
     weight: usize,
     budget: usize,
+    /// The latest entry too large for the budget, such as the listing of a folder with
+    /// hundreds of thousands of items: kept on its own while it is used, so viewing that
+    /// folder reads it once, and dropped by [`Cache::trim`] soon after.
+    large: Option<(u64, V, std::time::Instant)>,
+    /// Whether entries too large for the budget are kept at all.
+    keep_large: bool,
 }
 
 impl<V: Clone> Cache<V> {
-    fn new(budget: usize) -> Self {
-        Cache { map: HashMap::new(), order: VecDeque::new(), weight: 0, budget }
+    fn new(budget: usize, keep_large: bool) -> Self {
+        Cache { map: HashMap::new(), order: VecDeque::new(), weight: 0, budget, large: None, keep_large }
     }
 
-    fn get(&self, key: u64) -> Option<V> {
-        self.map.get(&key).map(|(v, _)| v.clone())
+    fn get(&mut self, key: u64) -> Option<V> {
+        match &mut self.large {
+            Some((k, v, used)) if *k == key => {
+                *used = std::time::Instant::now();
+                Some(v.clone())
+            }
+            _ => self.map.get(&key).map(|(v, _)| v.clone()),
+        }
+    }
+
+    /// Drops the large entry once it has not been used for `idle`.
+    fn trim(&mut self, idle: Duration) {
+        if self.large.as_ref().is_some_and(|(_, _, used)| used.elapsed() > idle) {
+            self.large = None;
+        }
     }
 
     fn insert(&mut self, key: u64, value: V, weight: usize) {
+        if weight > self.budget / 4 {
+            if self.keep_large {
+                self.large = Some((key, value, std::time::Instant::now()));
+            }
+            return;
+        }
         if self.map.insert(key, (value, weight)).is_none() {
             self.order.push_back(key);
             self.weight += weight;
@@ -267,20 +298,28 @@ impl<V: Clone> Cache<V> {
 
 /// One scanned location on disk.
 pub struct Store {
-    path: PathBuf,
     root: PathBuf,
     root_name: String,
-    reader: File,
+    reader: Option<File>,
     state: RwLock<State>,
     writer: Mutex<Writer>,
     blocks: Mutex<Cache<Arc<Vec<u8>>>>,
     listings: Mutex<Cache<Arc<Listing>>>,
+    decompressor: Mutex<zstd::bulk::Decompressor<'static>>,
 }
 
 impl Store {
     /// Starts a new scan of `root` in the file at `path`, replacing anything there.
     pub fn create(path: &Path, root: &Path, root_name: &str, root_mtime: u32) -> io::Result<Store> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        // A new file rather than truncating: a store still open on the old scan keeps reading it.
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         let header = Header {
             root: root.to_path_buf(),
             root_name: root_name.to_string(),
@@ -291,18 +330,53 @@ impl Store {
         };
         write_header(&file, &header)?;
         let state = State::new(root_name);
-        Store::assemble(path, file, header, state, HEADER_LEN)
+        Store::assemble(file, header, state, HEADER_LEN)
     }
 
-    /// Opens a saved scan, replaying its log. A torn block at the end is cut off.
+    /// An empty scan of `root` that is not saved anywhere, shown while a saved scan loads.
+    pub fn placeholder(root: &Path, root_name: &str) -> Store {
+        let header = Header {
+            root: root.to_path_buf(),
+            root_name: root_name.to_string(),
+            root_mtime: 0,
+            total: 0,
+            scanned_at: 0,
+            complete: false,
+        };
+        Store {
+            root: root.to_path_buf(),
+            root_name: root_name.to_string(),
+            reader: None,
+            state: RwLock::new(State::new(root_name)),
+            writer: Mutex::new(Writer { file: None, end: HEADER_LEN, buf: Vec::new(), header, failed: None }),
+            // A huge block holds a single listing, which the listing cache keeps once decoded.
+            blocks: Mutex::new(Cache::new(BLOCK_CACHE, false)),
+            listings: Mutex::new(Cache::new(LISTING_CACHE, true)),
+            decompressor: Mutex::new(zstd::bulk::Decompressor::new().expect("zstd context")),
+        }
+    }
+
+    /// A scan kept only in memory, because its file could not be created for `reason`.
+    pub fn in_memory(root: &Path, root_name: &str, reason: &str) -> Store {
+        let store = Store::placeholder(root, root_name);
+        store.writer.lock().failed = Some(reason.to_string());
+        store
+    }
+
+    /// Opens a saved scan, replaying its log. A torn block at the end is cut off. A scan
+    /// saved by an earlier version is converted first.
     pub fn open(path: &Path) -> io::Result<Store> {
+        if old_format::is_old(path) {
+            old_format::convert(path)?;
+        }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let header = read_header(&file)?;
         let mut state = State::new(&header.root_name);
         let len = file.metadata()?.len();
         let mut off = HEADER_LEN;
+        let mut z = zstd::bulk::Decompressor::new()?;
         while off < len {
-            let Some((raw, next)) = read_block(&file, off, len) else {
+            let Some((raw, next)) = read_block(&mut z, &file, off, len) else {
                 break;
             };
             let mut at = 0;
@@ -320,24 +394,20 @@ impl Store {
         if off < len {
             file.set_len(off)?;
         }
-        Store::assemble(path, file, header, state, off)
+        Store::assemble(file, header, state, off)
     }
 
-    fn assemble(path: &Path, file: File, header: Header, state: State, end: u64) -> io::Result<Store> {
+    fn assemble(file: File, header: Header, state: State, end: u64) -> io::Result<Store> {
         Ok(Store {
-            path: path.to_path_buf(),
             root: header.root.clone(),
             root_name: header.root_name.clone(),
-            reader: file.try_clone()?,
+            reader: Some(file.try_clone()?),
             state: RwLock::new(state),
-            writer: Mutex::new(Writer { file, end, buf: Vec::new(), header }),
-            blocks: Mutex::new(Cache::new(BLOCK_CACHE)),
-            listings: Mutex::new(Cache::new(LISTING_CACHE)),
+            writer: Mutex::new(Writer { file: Some(file), end, buf: Vec::new(), header, failed: None }),
+            blocks: Mutex::new(Cache::new(BLOCK_CACHE, false)),
+            listings: Mutex::new(Cache::new(LISTING_CACHE, true)),
+            decompressor: Mutex::new(zstd::bulk::Decompressor::new()?),
         })
-    }
-
-    pub fn file(&self) -> &Path {
-        &self.path
     }
 
     pub fn root_path(&self) -> &Path {
@@ -388,7 +458,7 @@ impl Store {
 
     /// Takes `item` out, as when it was deleted on disk. Its folder and their ancestors
     /// shrink at once.
-    pub fn remove(&self, item: ItemId) -> io::Result<()> {
+    pub fn remove(&self, item: NodeId) -> io::Result<()> {
         if item == ROOT || !self.is_attached(item) {
             return Ok(());
         }
@@ -405,7 +475,7 @@ impl Store {
 
     /// Starts a rescan of folder `item`: returns a shadow folder to read into, which
     /// replaces the folder's contents once [`Store::graft`] is called.
-    pub fn shadow(&self, item: ItemId) -> io::Result<Option<DirId>> {
+    pub fn shadow(&self, item: NodeId) -> io::Result<Option<DirId>> {
         let mut w = self.writer.lock();
         let mut st = self.state.write();
         let Some(of) = dir_of(&st, item) else {
@@ -436,10 +506,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_root_mtime(&self, mtime: u32) {
-        self.writer.lock().header.root_mtime = mtime;
-    }
-
     /// Writes everything recorded so far and the summary, so a crash loses nothing older.
     /// `complete` marks a scan with nothing left to read; `scanned_at` is kept otherwise.
     pub fn checkpoint(&self, complete: bool, scanned_at: Option<SystemTime>) -> io::Result<()> {
@@ -450,8 +516,21 @@ impl Store {
         if let Some(at) = scanned_at {
             w.header.scanned_at = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         }
-        write_header(&w.file, &w.header)?;
-        w.file.sync_data()
+        let Some(file) = &w.file else {
+            return Ok(());
+        };
+        write_header(file, &w.header)?;
+        file.sync_data()
+    }
+
+    /// True once a scan finished with nothing left to read.
+    pub fn complete(&self) -> bool {
+        self.writer.lock().header.complete
+    }
+
+    /// Why the scan could not be saved, if writing failed (for example on a full disk).
+    pub fn write_error(&self) -> Option<String> {
+        self.writer.lock().failed.clone()
     }
 
     // ----- Reading -----
@@ -475,12 +554,9 @@ impl Store {
             .collect()
     }
 
-    /// Folders found but not read yet inside the shadow `shadow`.
-    pub fn pending_in(&self, shadow: DirId) -> Vec<DirId> {
-        let st = self.state.read();
-        (0..st.dirs.len() as DirId)
-            .filter(|&d| st.dirs[d as usize].loc == UNLISTED && within(&st, d, shadow))
-            .collect()
+    /// Frees a huge folder's listing once it has not been used for a while.
+    pub fn trim(&self) {
+        self.listings.lock().trim(Duration::from_secs(10));
     }
 
     pub fn items(&self) -> u64 {
@@ -488,12 +564,13 @@ impl Store {
     }
 
     /// The folder number of folder item `item`.
-    pub fn dir_of(&self, item: ItemId) -> Option<DirId> {
+    pub fn dir_of(&self, item: NodeId) -> Option<DirId> {
         dir_of(&self.state.read(), item)
     }
 
     /// The item of folder `dir`.
-    pub fn item_of(&self, dir: DirId) -> ItemId {
+    #[cfg(test)]
+    pub fn item_of(&self, dir: DirId) -> NodeId {
         self.state.read().dirs.get(dir as usize).map_or(NONE, |d| d.item)
     }
 
@@ -513,7 +590,7 @@ impl Store {
         path
     }
 
-    pub fn node(&self, item: ItemId) -> Node {
+    pub fn node(&self, item: NodeId) -> Node {
         if item == ROOT {
             let size = self.state.read().dirs[0].size;
             return Node { size, mtime: self.writer.lock().header.root_mtime, kind: Kind::Dir, flags: 0 };
@@ -524,19 +601,17 @@ impl Store {
         let Some(listing) = self.listing(dir) else {
             return Node::MISSING;
         };
-        let e = listing.entries[i];
-        let size = if e.child == NONE { e.size } else { self.state.read().dirs.get(e.child as usize).map_or(0, |d| d.size) };
-        Node { size, mtime: e.mtime, kind: Kind::from_u8(e.kind), flags: e.flags & !flags::LINKED }
+        node_of(&self.state.read(), &listing.entries[i])
     }
 
-    pub fn size(&self, item: ItemId) -> u64 {
+    pub fn size(&self, item: NodeId) -> u64 {
         if let Some(d) = self.dir_of(item) {
             return self.state.read().dirs[d as usize].size;
         }
         self.node(item).size
     }
 
-    pub fn name(&self, item: ItemId) -> OsString {
+    pub fn name(&self, item: NodeId) -> OsString {
         if item == ROOT {
             return OsString::from(&self.root_name);
         }
@@ -546,13 +621,41 @@ impl Store {
         }
     }
 
-    pub fn display_name(&self, item: ItemId) -> String {
-        self.name(item).to_string_lossy().into_owned()
+    pub fn display_name(&self, item: NodeId) -> Cow<'static, str> {
+        Cow::Owned(self.name(item).to_string_lossy().into_owned())
+    }
+
+    /// The folder holding `item`; `NONE` for the root.
+    pub fn parent(&self, item: NodeId) -> NodeId {
+        let st = self.state.read();
+        locate(&st, item).map_or(NONE, |(d, _)| st.dirs[d as usize].item)
+    }
+
+    /// True if `item` is a folder that was read and is not empty.
+    pub fn has_children(&self, item: NodeId) -> bool {
+        let st = self.state.read();
+        dir_of(&st, item).is_some_and(|d| {
+            let d = &st.dirs[d as usize];
+            d.loc != UNLISTED && (d.first_item..d.first_item + d.count).any(|i| !st.removed.contains(&i))
+        })
     }
 
     /// The folder holding `item`, and the item's position in its listing.
-    fn locate(&self, item: ItemId) -> Option<(DirId, usize)> {
+    fn locate(&self, item: NodeId) -> Option<(DirId, usize)> {
         locate(&self.state.read(), item)
+    }
+
+    /// The uncompressed block holding the record at `loc`, and the record's offset in it.
+    fn raw_record(&self, loc: u64) -> Option<(Arc<Vec<u8>>, usize)> {
+        let block_off = loc >> IN_BLOCK_BITS;
+        let at = (loc & ((1 << IN_BLOCK_BITS) - 1)) as usize;
+        let w = self.writer.lock();
+        if block_off == w.end {
+            // Still in the block being collected.
+            return Some((Arc::new(w.buf.clone()), at));
+        }
+        drop(w);
+        Some((self.block(block_off)?, at))
     }
 
     fn listing(&self, dir: DirId) -> Option<Arc<Listing>> {
@@ -563,18 +666,7 @@ impl Store {
         if let Some(l) = self.listings.lock().get(loc) {
             return Some(l);
         }
-        let block_off = loc >> IN_BLOCK_BITS;
-        let at = (loc & ((1 << IN_BLOCK_BITS) - 1)) as usize;
-        let raw = {
-            let w = self.writer.lock();
-            if block_off == w.end {
-                // Still in the block being collected.
-                Arc::new(w.buf.clone())
-            } else {
-                drop(w);
-                self.block(block_off)?
-            }
-        };
+        let (raw, at) = self.raw_record(loc)?;
         let (tag, payload, _) = split_record(&raw, at)?;
         if tag != TAG_LISTING {
             return None;
@@ -588,28 +680,48 @@ impl Store {
         if let Some(b) = self.blocks.lock().get(off) {
             return Some(b);
         }
-        let len = self.reader.metadata().ok()?.len();
-        let (raw, _) = read_block(&self.reader, off, len)?;
+        let reader = self.reader.as_ref()?;
+        let len = reader.metadata().ok()?.len();
+        let (raw, _) = read_block(&mut self.decompressor.lock(), reader, off, len)?;
         let raw = Arc::new(raw);
         self.blocks.lock().insert(off, raw.clone(), raw.len());
         Some(raw)
     }
 
     /// The items in folder `item`, in the order they were found.
-    pub fn children(&self, item: ItemId) -> Vec<ItemId> {
+    pub fn children(&self, item: NodeId) -> std::vec::IntoIter<NodeId> {
         let st = self.state.read();
         let Some(dir) = dir_of(&st, item) else {
-            return Vec::new();
+            return Vec::new().into_iter();
         };
         let d = &st.dirs[dir as usize];
         if d.loc == UNLISTED {
-            return Vec::new();
+            return Vec::new().into_iter();
         }
-        (d.first_item..d.first_item + d.count).filter(|i| !st.removed.contains(i)).collect()
+        (d.first_item..d.first_item + d.count).filter(|i| !st.removed.contains(i)).collect::<Vec<_>>().into_iter()
+    }
+
+    /// The items in folder `item` with their nodes and names, from one read of its listing.
+    pub fn entries(&self, item: NodeId) -> Vec<(NodeId, Node, OsString)> {
+        let Some(dir) = self.dir_of(item) else {
+            return Vec::new();
+        };
+        let Some(listing) = self.listing(dir) else {
+            return Vec::new();
+        };
+        let st = self.state.read();
+        listing
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (listing.first_item + i as u32, i, e))
+            .filter(|(id, _, _)| !st.removed.contains(id))
+            .map(|(id, i, e)| (id, node_of(&st, e), listing.name(i).to_os_string()))
+            .collect()
     }
 
     /// Children with their sizes and names, read once.
-    fn sized_children(&self, item: ItemId) -> Vec<(ItemId, u64, OsString)> {
+    fn sized_children(&self, item: NodeId) -> Vec<(NodeId, u64, OsString)> {
         let Some(dir) = self.dir_of(item) else {
             return Vec::new();
         };
@@ -631,7 +743,7 @@ impl Store {
     }
 
     /// Children ordered largest first, ties broken by name.
-    pub fn sorted_children(&self, item: ItemId) -> Vec<ItemId> {
+    pub fn sorted_children(&self, item: NodeId) -> Vec<NodeId> {
         let mut v = self.sized_children(item);
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
         v.into_iter().map(|(id, _, _)| id).collect()
@@ -639,9 +751,9 @@ impl Store {
 
     /// The `limit` largest children, largest first, plus how many others there are and their
     /// total size. Selects before sorting, so a folder with a million entries costs one pass.
-    pub fn largest_children(&self, item: ItemId, limit: usize) -> (Vec<ItemId>, usize, u64) {
+    pub fn largest_children(&self, item: NodeId, limit: usize) -> (Vec<NodeId>, usize, u64) {
         let mut kids = self.sized_children(item);
-        let order = |a: &(ItemId, u64, OsString), b: &(ItemId, u64, OsString)| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2));
+        let order = |a: &(NodeId, u64, OsString), b: &(NodeId, u64, OsString)| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2));
         let mut rest = Vec::new();
         if kids.len() > limit {
             kids.select_nth_unstable_by(limit, order);
@@ -652,7 +764,7 @@ impl Store {
     }
 
     /// Items from the root down to and including `item`.
-    pub fn ancestry(&self, item: ItemId) -> Vec<ItemId> {
+    pub fn ancestry(&self, item: NodeId) -> Vec<NodeId> {
         let st = self.state.read();
         let mut v = vec![item];
         let mut d = if item == ROOT { None } else { locate(&st, item).map(|(d, _)| d) };
@@ -665,7 +777,7 @@ impl Store {
         v
     }
 
-    pub fn path(&self, item: ItemId) -> PathBuf {
+    pub fn path(&self, item: NodeId) -> PathBuf {
         if item == ROOT {
             return self.root.clone();
         }
@@ -679,7 +791,7 @@ impl Store {
     }
 
     /// The item at absolute path `path`, if it is in this scan.
-    pub fn find(&self, path: &Path) -> Option<ItemId> {
+    pub fn find(&self, path: &Path) -> Option<NodeId> {
         let rel = path.strip_prefix(&self.root).ok()?;
         let mut cur = ROOT;
         for part in rel.components() {
@@ -695,7 +807,7 @@ impl Store {
     }
 
     /// False once `item` or a folder holding it was removed or replaced by a rescan.
-    pub fn is_attached(&self, item: ItemId) -> bool {
+    pub fn is_attached(&self, item: NodeId) -> bool {
         let st = self.state.read();
         if item == ROOT {
             return true;
@@ -708,13 +820,13 @@ impl Store {
 
     /// Calls `visit` for every item below `from` with its node and name; descends into a
     /// folder when `visit` returns true. Reads the listings from disk as needed.
-    pub fn walk(&self, from: ItemId, mut visit: impl FnMut(ItemId, &Node, &OsStr) -> bool) {
+    pub fn walk(&self, from: NodeId, mut visit: impl FnMut(NodeId, &Node, &OsStr) -> bool) {
         let mut stack: Vec<DirId> = self.dir_of(from).into_iter().collect();
         while let Some(dir) = stack.pop() {
             let Some(listing) = self.listing(dir) else {
                 continue;
             };
-            let children: Vec<(ItemId, Node, DirId)> = {
+            let children: Vec<(NodeId, Node, DirId)> = {
                 let st = self.state.read();
                 listing
                     .entries
@@ -722,11 +834,7 @@ impl Store {
                     .enumerate()
                     .map(|(i, e)| (listing.first_item + i as u32, e))
                     .filter(|(id, _)| !st.removed.contains(id))
-                    .map(|(id, e)| {
-                        let size = if e.child == NONE { e.size } else { st.dirs[e.child as usize].size };
-                        let node = Node { size, mtime: e.mtime, kind: Kind::from_u8(e.kind), flags: e.flags & !flags::LINKED };
-                        (id, node, e.child)
-                    })
+                    .map(|(id, e)| (id, node_of(&st, e), e.child))
                     .collect()
             };
             for (i, (id, node, child)) in children.into_iter().enumerate() {
@@ -737,26 +845,113 @@ impl Store {
         }
     }
 
+    /// Calls `visit` for every item below `from`, but not inside folders whose flags match
+    /// `skip`, on several threads; each thread has its own `V` from `init`, and all are
+    /// returned. Each thread unpacks whole blocks in turn and reads the entries straight from
+    /// them, so a whole-disk walk is one parallel pass over the file. Choosing the folders
+    /// checks every folder of the scan, so for a small subtree [`Store::walk`] is faster.
+    pub fn visit_all<V: Send>(
+        &self,
+        from: NodeId,
+        skip: u8,
+        init: impl Fn() -> V + Sync,
+        visit: impl Fn(&mut V, NodeId, &Node, &OsStr) + Sync,
+    ) -> Vec<V> {
+        // Listings to read, grouped by block: (block offset, offsets of records in it).
+        let blocks: Vec<(u64, Vec<usize>)> = {
+            let st = self.state.read();
+            let Some(top) = dir_of(&st, from) else {
+                return Vec::new();
+            };
+            let mut locs: Vec<u64> = (0..st.dirs.len() as DirId)
+                .filter(|&d| st.dirs[d as usize].loc != UNLISTED && below(&st, d, top, skip))
+                .map(|d| st.dirs[d as usize].loc)
+                .collect();
+            locs.sort_unstable();
+            let mut blocks: Vec<(u64, Vec<usize>)> = Vec::new();
+            for loc in locs {
+                let (block, at) = (loc >> IN_BLOCK_BITS, (loc & ((1 << IN_BLOCK_BITS) - 1)) as usize);
+                match blocks.last_mut() {
+                    Some((b, ats)) if *b == block => ats.push(at),
+                    _ => blocks.push((block, vec![at])),
+                }
+            }
+            blocks
+        };
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(blocks.len().max(1));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut acc = init();
+                        let mut z = zstd::bulk::Decompressor::new().ok();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((block, ats)) = blocks.get(i) else {
+                                break;
+                            };
+                            let raw = {
+                                let w = self.writer.lock();
+                                if *block == w.end {
+                                    w.buf.clone()
+                                } else {
+                                    drop(w);
+                                    let (Some(reader), Some(z)) = (self.reader.as_ref(), z.as_mut()) else {
+                                        continue;
+                                    };
+                                    let len = reader.metadata().map_or(0, |m| m.len());
+                                    let Some((raw, _)) = read_block(z, reader, *block, len) else {
+                                        continue;
+                                    };
+                                    raw
+                                }
+                            };
+                            let st = self.state.read();
+                            let none_removed = st.removed.is_empty();
+                            for &at in ats {
+                                if let Some((TAG_LISTING, payload, _)) = split_record(&raw, at) {
+                                    for_each_entry(payload, |id, e, _, name| {
+                                        if none_removed || !st.removed.contains(&id) {
+                                            visit(&mut acc, id, &node_of(&st, e), OsStr::from_bytes(name));
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        acc
+                    })
+                })
+                .collect();
+            workers.into_iter().filter_map(|w| w.join().ok()).collect()
+        })
+    }
+
     /// The `n` largest items below `from`. Packages count as one item, like in Finder.
-    pub fn biggest(&self, from: ItemId, n: usize) -> Vec<ItemId> {
-        let mut heap: BinaryHeap<Reverse<(u64, ItemId)>> = BinaryHeap::with_capacity(n + 1);
-        self.walk(from, |id, node, _| {
-            if node.is_dir() && !node.has(flags::PACKAGE) {
-                return true;
-            }
-            heap.push(Reverse((node.size, id)));
-            if heap.len() > n {
-                heap.pop();
-            }
-            false
-        });
-        let mut v: Vec<(u64, ItemId)> = heap.into_iter().map(|Reverse(e)| e).collect();
-        v.sort_by(|a, b| b.cmp(a));
-        v.into_iter().map(|(_, id)| id).collect()
+    pub fn biggest(&self, from: NodeId, n: usize) -> Vec<NodeId> {
+        let heaps = self.visit_all(
+            from,
+            flags::PACKAGE,
+            || BinaryHeap::<Reverse<(u64, NodeId)>>::with_capacity(n + 1),
+            |heap, id, node, _| {
+                if node.is_dir() && !node.has(flags::PACKAGE) {
+                    return;
+                }
+                // Most items are smaller than the smallest of the largest so far.
+                if heap.len() == n && heap.peek().is_some_and(|Reverse((s, _))| node.size <= *s) {
+                    return;
+                }
+                heap.push(Reverse((node.size, id)));
+                if heap.len() > n {
+                    heap.pop();
+                }
+            },
+        );
+        largest_of(heaps, n)
     }
 
     /// Items below `from` whose name contains `query` (case-insensitive), largest first.
-    pub fn search(&self, from: ItemId, query: &str, limit: usize) -> Vec<ItemId> {
+    pub fn search(&self, from: NodeId, query: &str, limit: usize) -> Vec<NodeId> {
         let query = query.to_lowercase();
         if query.is_empty() {
             return Vec::new();
@@ -770,37 +965,58 @@ impl Store {
                 String::from_utf8_lossy(name).to_lowercase().contains(&query)
             }
         };
-        let mut heap: BinaryHeap<Reverse<(u64, ItemId)>> = BinaryHeap::new();
-        self.walk(from, |id, node, name| {
-            if matches(name.as_bytes()) {
-                heap.push(Reverse((node.size, id)));
-                if heap.len() > limit {
-                    heap.pop();
+        let heaps = self.visit_all(
+            from,
+            0,
+            BinaryHeap::<Reverse<(u64, NodeId)>>::new,
+            |heap, id, node, name| {
+                if matches(name.as_bytes()) {
+                    heap.push(Reverse((node.size, id)));
+                    if heap.len() > limit {
+                        heap.pop();
+                    }
                 }
-            }
-            true
-        });
-        let mut v: Vec<(u64, ItemId)> = heap.into_iter().map(|Reverse(e)| e).collect();
-        v.sort_by(|a, b| b.cmp(a));
-        v.into_iter().map(|(_, id)| id).collect()
+            },
+        );
+        largest_of(heaps, limit)
     }
 }
 
 impl Writer {
-    /// Adds a record to the block being collected and returns its location.
+    /// Adds a record to the block being collected and returns its location. A block that
+    /// cannot be written stays in memory, so scanning goes on when the disk is full.
     fn append(&mut self, tag: u8, payload: &[u8]) -> io::Result<u64> {
+        // A record that fills a block by itself gets a block of its own: a block is read
+        // whole, so small records next to a huge one would each cost reading all of it.
+        if payload.len() >= BLOCK && !self.buf.is_empty() {
+            self.flush_or_keep();
+        }
         let at = self.buf.len() as u64;
+        if at >= 1 << IN_BLOCK_BITS || self.end >= 1 << (64 - IN_BLOCK_BITS) {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "scan too large to keep"));
+        }
         let loc = (self.end << IN_BLOCK_BITS) | at;
         self.buf.push(tag);
         self.buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(payload);
         if self.buf.len() >= BLOCK {
-            self.flush_block()?;
+            self.flush_or_keep();
         }
         Ok(loc)
     }
 
+    /// Writes the collected block; if that fails, keeps it in memory and remembers why.
+    fn flush_or_keep(&mut self) {
+        match self.flush_block() {
+            Ok(()) => self.failed = None,
+            Err(e) => self.failed = Some(e.to_string()),
+        }
+    }
+
     fn flush_block(&mut self) -> io::Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -812,11 +1028,30 @@ impl Writer {
         block.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         block.extend_from_slice(&(self.buf.len() as u32).to_le_bytes());
         block.extend_from_slice(&compressed);
-        self.file.write_all_at(&block, self.end)?;
+        file.write_all_at(&block, self.end)?;
         self.end += block.len() as u64;
-        self.buf.clear();
+        // A huge folder's listing makes one huge block; do not keep its buffer afterwards.
+        if self.buf.capacity() > 4 * BLOCK {
+            self.buf = Vec::new();
+        } else {
+            self.buf.clear();
+        }
         Ok(())
     }
+}
+
+/// The `n` largest of several partial results, largest first.
+fn largest_of(heaps: Vec<BinaryHeap<Reverse<(u64, NodeId)>>>, n: usize) -> Vec<NodeId> {
+    let mut v: Vec<(u64, NodeId)> = heaps.into_iter().flatten().map(|Reverse(e)| e).collect();
+    v.sort_by(|a, b| b.cmp(a));
+    v.truncate(n);
+    v.into_iter().map(|(_, id)| id).collect()
+}
+
+/// An entry as a view sees it: a folder's size is the live total of everything inside.
+fn node_of(st: &State, e: &Entry) -> Node {
+    let size = if e.child == NONE { e.size } else { st.dirs.get(e.child as usize).map_or(e.size, |d| d.size) };
+    Node { size, mtime: e.mtime, kind: Kind::from_u8(e.kind), flags: e.flags & !flags::LINKED }
 }
 
 fn now() -> u64 {
@@ -867,7 +1102,8 @@ fn read_header(file: &File) -> io::Result<Header> {
 }
 
 /// The block at `off` uncompressed, and where the next block starts; `None` if it is torn.
-fn read_block(file: &File, off: u64, len: u64) -> Option<(Vec<u8>, u64)> {
+/// `z` is reused from block to block: creating a context per block cost as much as reading.
+fn read_block(z: &mut zstd::bulk::Decompressor<'static>, file: &File, off: u64, len: u64) -> Option<(Vec<u8>, u64)> {
     let mut head = [0u8; 8];
     file.read_exact_at(&mut head, off).ok()?;
     let compressed_len = u64::from(u32::from_le_bytes(head[..4].try_into().unwrap()));
@@ -878,7 +1114,7 @@ fn read_block(file: &File, off: u64, len: u64) -> Option<(Vec<u8>, u64)> {
     }
     let mut compressed = vec![0u8; compressed_len as usize];
     file.read_exact_at(&mut compressed, off + 8).ok()?;
-    let raw = zstd::bulk::decompress(&compressed, raw_len).ok()?;
+    let raw = z.decompress(&compressed, raw_len).ok()?;
     (raw.len() == raw_len).then_some((raw, next))
 }
 
@@ -905,64 +1141,66 @@ fn encode_entry(out: &mut Vec<u8>, kind: Kind, flags: u8, name: &[u8], mtime: u3
     out.extend_from_slice(name);
 }
 
-struct Decoded<'a> {
-    dir: DirId,
-    first_item: ItemId,
-    entries: Vec<DecodedEntry<'a>>,
-}
-
-struct DecodedEntry<'a> {
-    entry: Entry,
-    link: Option<(u64, u64)>,
-    name: &'a [u8],
-}
-
-fn decode_entries(payload: &[u8]) -> Option<Decoded<'_>> {
+/// Calls `f` with the item number, entry, hard link and name of each entry of a listing
+/// record, without collecting them. Returns false if the record is damaged.
+fn for_each_entry(payload: &[u8], mut f: impl FnMut(NodeId, &Entry, Option<Link>, &[u8])) -> bool {
     let u32_at = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(payload.get(i..i + 4)?.try_into().ok()?)) };
-    let (dir, first_item, count) = (u32_at(0)?, u32_at(4)?, u32_at(8)? as usize);
-    let mut entries = Vec::with_capacity(count);
+    let (Some(first_item), Some(count)) = (u32_at(4), u32_at(8)) else {
+        return false;
+    };
     let mut at = 12;
-    for _ in 0..count {
-        let head = payload.get(at..at + 20)?;
-        let kind = head[0];
-        let flags = head[1];
-        let name_len = u16::from_le_bytes(head[2..4].try_into().ok()?);
-        let mtime = u32::from_le_bytes(head[4..8].try_into().ok()?);
-        let size = u64::from_le_bytes(head[8..16].try_into().ok()?);
-        let child = u32::from_le_bytes(head[16..20].try_into().ok()?);
-        at += 20;
-        let link = if flags & flags::LINKED != 0 {
-            let l = payload.get(at..at + 16)?;
-            at += 16;
-            Some((u64::from_le_bytes(l[..8].try_into().ok()?), u64::from_le_bytes(l[8..].try_into().ok()?)))
-        } else {
-            None
+    for i in 0..count {
+        let Some((entry, link, name, next)) = entry_at(payload, at) else {
+            return false;
         };
-        let name = payload.get(at..at + name_len as usize)?;
-        at += name_len as usize;
-        let entry = Entry { size, mtime, child, name_off: 0, name_len, kind, flags };
-        entries.push(DecodedEntry { entry, link, name });
+        f(first_item + i, &entry, link, name);
+        at = next;
     }
-    Some(Decoded { dir, first_item, entries })
+    true
+}
+
+/// A file's device and inode, kept for files with several hard links.
+type Link = (u64, u64);
+
+/// The entry starting at `at`, its hard link and name, and where the next one starts.
+fn entry_at(payload: &[u8], mut at: usize) -> Option<(Entry, Option<Link>, &[u8], usize)> {
+    let head = payload.get(at..at + 20)?;
+    let kind = head[0];
+    let flags = head[1];
+    let name_len = u16::from_le_bytes(head[2..4].try_into().ok()?);
+    let mtime = u32::from_le_bytes(head[4..8].try_into().ok()?);
+    let size = u64::from_le_bytes(head[8..16].try_into().ok()?);
+    let child = u32::from_le_bytes(head[16..20].try_into().ok()?);
+    at += 20;
+    let link = if flags & flags::LINKED != 0 {
+        let l = payload.get(at..at + 16)?;
+        at += 16;
+        Some((u64::from_le_bytes(l[..8].try_into().ok()?), u64::from_le_bytes(l[8..].try_into().ok()?)))
+    } else {
+        None
+    };
+    let name = payload.get(at..at + name_len as usize)?;
+    let entry = Entry { size, mtime, child, name_off: 0, name_len, kind, flags };
+    Some((entry, link, name, at + name_len as usize))
 }
 
 fn decode_listing(payload: &[u8]) -> Option<Listing> {
-    let d = decode_entries(payload)?;
-    let mut names = Vec::new();
-    let entries = d
-        .entries
-        .into_iter()
-        .map(|d| {
-            let mut e = d.entry;
-            e.name_off = names.len() as u32;
-            names.extend_from_slice(d.name);
-            e
-        })
-        .collect();
-    Some(Listing { first_item: d.first_item, entries, names })
+    let first_item = u32::from_le_bytes(payload.get(4..8)?.try_into().ok()?);
+    let count = u32::from_le_bytes(payload.get(8..12)?.try_into().ok()?) as usize;
+    let mut entries = Vec::with_capacity(count);
+    // The names take what the fixed parts leave; sized once, since growing showed up as a
+    // cost when walking a whole disk.
+    let mut names = Vec::with_capacity(payload.len().saturating_sub(12 + 20 * count));
+    let complete = for_each_entry(payload, |_, e, _, name| {
+        let mut e = *e;
+        e.name_off = names.len() as u32;
+        names.extend_from_slice(name);
+        entries.push(e);
+    });
+    complete.then_some(Listing { first_item, entries, names })
 }
 
-fn push_dir(st: &mut State, parent: DirId, item: ItemId, name: &[u8], own: u32, flags: u8) -> DirId {
+fn push_dir(st: &mut State, parent: DirId, item: NodeId, name: &[u8], own: u32, flags: u8) -> DirId {
     let id = st.dirs.len() as DirId;
     let name_off = st.names.len() as u32;
     st.names.extend_from_slice(name);
@@ -999,16 +1237,35 @@ fn add_up(st: &mut State, mut dir: DirId, delta: i64) {
     }
 }
 
-fn locate(st: &State, item: ItemId) -> Option<(DirId, usize)> {
+fn locate(st: &State, item: NodeId) -> Option<(DirId, usize)> {
     let i = st.listings.partition_point(|&(first, _)| first <= item).checked_sub(1)?;
     let (first, dir) = st.listings[i];
     let d = st.dirs.get(dir as usize)?;
     (d.first_item == first && item < first + d.count && d.loc != UNLISTED).then_some((dir, (item - first) as usize))
 }
 
-fn dir_of(st: &State, item: ItemId) -> Option<DirId> {
+fn dir_of(st: &State, item: NodeId) -> Option<DirId> {
     let i = st.dirs.partition_point(|d| d.item < item);
     (st.dirs.get(i)?.item == item).then_some(i as DirId)
+}
+
+/// True if `dir` is `top`, or inside it through current listings without passing a folder
+/// whose flags match `skip`.
+fn below(st: &State, mut dir: DirId, top: DirId, skip: u8) -> bool {
+    loop {
+        if dir == top {
+            return true;
+        }
+        let d = &st.dirs[dir as usize];
+        if d.parent == NONE || d.flags & (skip | flags::SHADOW) != 0 || st.removed.contains(&d.item) {
+            return false;
+        }
+        let p = &st.dirs[d.parent as usize];
+        if p.loc == UNLISTED || d.item < p.first_item || d.item >= p.first_item + p.count {
+            return false;
+        }
+        dir = d.parent;
+    }
 }
 
 /// True if `dir` is reachable from the root through current listings.
@@ -1029,57 +1286,40 @@ fn dir_attached(st: &State, mut dir: DirId) -> bool {
     }
 }
 
-/// True if `dir` is `shadow` or inside it.
-fn within(st: &State, mut dir: DirId, shadow: DirId) -> bool {
-    loop {
-        if dir == shadow {
-            return true;
-        }
-        let d = &st.dirs[dir as usize];
-        if d.parent == NONE || d.flags & flags::SHADOW != 0 {
-            return false;
-        }
-        dir = d.parent;
-    }
-}
-
 /// Applies one record to the folder table, when it is written and when the file is opened.
 fn replay(st: &mut State, tag: u8, payload: &[u8], loc: u64) {
     let u32_at = |i: usize| payload.get(i..i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     match tag {
         TAG_LISTING => {
-            let Some(d) = decode_entries(payload) else {
+            let (Some(dir), Some(first_item), Some(count)) = (u32_at(0), u32_at(4), u32_at(8)) else {
                 return;
             };
-            let Some(dir) = st.dirs.get(d.dir as usize) else {
-                return;
-            };
-            if dir.loc != UNLISTED {
+            if st.dirs.get(dir as usize).is_none_or(|d| d.loc != UNLISTED) {
                 return;
             }
             let mut total: u64 = 0;
-            for (i, DecodedEntry { entry: e, link, name }) in d.entries.iter().enumerate() {
+            // Streamed: collecting each listing first made opening a large scan slow.
+            for_each_entry(payload, |item, e, link, name| {
                 total += e.size;
                 if let Some(link) = link {
-                    st.counted.insert(*link);
+                    st.counted.insert(link);
                 }
                 if e.child != NONE {
                     // Folders are numbered in the order they are found, so this one is next.
                     debug_assert_eq!(e.child as usize, st.dirs.len());
                     let own = u32::try_from(e.size).unwrap_or(u32::MAX);
-                    let id = push_dir(st, d.dir, d.first_item + i as u32, name, own, e.flags & (flags::HIDDEN | flags::PACKAGE));
+                    let id = push_dir(st, dir, item, name, own, e.flags & (flags::HIDDEN | flags::PACKAGE));
                     // Its own size is already in `total`; counted once.
                     st.dirs[id as usize].size = e.size;
                 }
-            }
-            let count = d.entries.len() as u32;
-            let x = &mut st.dirs[d.dir as usize];
+            });
+            let x = &mut st.dirs[dir as usize];
             x.loc = loc;
-            x.first_item = d.first_item;
+            x.first_item = first_item;
             x.count = count;
-            st.listings.push((d.first_item, d.dir));
-            st.next_item = st.next_item.max(d.first_item + count);
-            add_up(st, d.dir, total as i64);
+            st.listings.push((first_item, dir));
+            st.next_item = st.next_item.max(first_item + count);
+            add_up(st, dir, total as i64);
         }
         TAG_REMOVE => {
             let (Some(item), Some(size)) = (u32_at(0), payload.get(4..12).map(|b| u64::from_le_bytes(b.try_into().unwrap()))) else {
@@ -1140,6 +1380,299 @@ fn replay(st: &mut State, tag: u8, payload: &[u8], loc: u64) {
     }
 }
 
+/// Where saved scans are kept.
+pub fn dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Caches")
+        .join(crate::BUNDLE_ID)
+}
+
+/// The file for a scan of `root`. FNV-1a, because the name must stay stable across Rust
+/// releases.
+pub fn file_for(dir: &Path, root: &Path) -> PathBuf {
+    let hash = root.as_os_str().as_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    dir.join(format!("{hash:016x}.scan"))
+}
+
+/// Summaries of all saved scans, from their headers; unreadable files are skipped.
+pub fn list(dir: &Path) -> Vec<Summary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "scan"))
+        .filter_map(|e| summary_of(&e.path()))
+        .collect()
+}
+
+fn summary_of(path: &Path) -> Option<Summary> {
+    if old_format::is_old(path) {
+        return old_format::summary(path);
+    }
+    let h = read_header(&File::open(path).ok()?).ok()?;
+    Some(Summary {
+        root: h.root,
+        total: h.total,
+        scanned_at: UNIX_EPOCH + Duration::from_secs(h.scanned_at),
+        complete: h.complete,
+    })
+}
+
+/// Opens the saved scan of `root`, if there is one.
+pub fn load(dir: &Path, root: &Path) -> io::Result<Store> {
+    let store = Store::open(&file_for(dir, root))?;
+    if store.root_path() != root {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scan file belongs to another location"));
+    }
+    Ok(store)
+}
+
+/// Scans saved by versions that kept the whole tree in memory: one zstd stream with every
+/// node. They are converted to the current format when first opened.
+mod old_format {
+    use super::*;
+
+    const MAGIC: &[u8; 8] = b"WHATDSK2";
+    const HEADER: usize = 64;
+    const NODE: usize = 32;
+
+    pub(super) fn is_old(path: &Path) -> bool {
+        let mut magic = [0u8; 8];
+        File::open(path).and_then(|f| f.read_exact_at(&mut magic, 0)).is_ok() && &magic == MAGIC
+    }
+
+    struct Old {
+        scanned_at: u64,
+        total: u64,
+        nodes: usize,
+        names: usize,
+        pending: usize,
+        links: usize,
+        complete: bool,
+        root: PathBuf,
+    }
+
+    fn header(file: &mut File) -> Option<Old> {
+        let mut h = [0u8; 8 + HEADER];
+        file.read_exact(&mut h).ok()?;
+        if &h[..8] != MAGIC {
+            return None;
+        }
+        let at = |i: usize| u64::from_le_bytes(h[8 + i * 8..16 + i * 8].try_into().unwrap());
+        let mut root = vec![0u8; at(4) as usize];
+        file.read_exact(&mut root).ok()?;
+        Some(Old {
+            scanned_at: at(0),
+            total: at(1),
+            nodes: at(2) as usize,
+            names: at(3) as usize,
+            pending: at(5) as usize,
+            links: at(6) as usize,
+            complete: at(7) != 0,
+            root: PathBuf::from(OsStr::from_bytes(&root)),
+        })
+    }
+
+    pub(super) fn summary(path: &Path) -> Option<Summary> {
+        let h = header(&mut File::open(path).ok()?)?;
+        Some(Summary {
+            root: h.root,
+            total: h.total,
+            scanned_at: UNIX_EPOCH + Duration::from_secs(h.scanned_at),
+            complete: h.complete,
+        })
+    }
+
+    /// Rewrites the old file at `path` in the current format, folder by folder.
+    pub(super) fn convert(path: &Path) -> io::Result<()> {
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "damaged scan file");
+        let mut file = File::open(path)?;
+        let h = header(&mut file).ok_or_else(bad)?;
+        let mut z = zstd::Decoder::new(file)?;
+        let mut nodes = vec![0u8; h.nodes * NODE];
+        z.read_exact(&mut nodes)?;
+        let mut names = vec![0u8; h.names];
+        z.read_exact(&mut names)?;
+        let mut pending = vec![0u8; h.pending];
+        z.read_exact(&mut pending)?;
+        let mut links = vec![0u8; h.links * 16];
+        z.read_exact(&mut links)?;
+
+        let u32_at = |n: usize, off: usize| u32::from_le_bytes(nodes[n * NODE + off..n * NODE + off + 4].try_into().unwrap());
+        let size = |n: usize| u64::from_le_bytes(nodes[n * NODE..n * NODE + 8].try_into().unwrap());
+        let name = |n: usize| {
+            let off = u32_at(n, 20) as usize;
+            let len = u16::from_le_bytes(nodes[n * NODE + 28..n * NODE + 30].try_into().unwrap()) as usize;
+            &names[off..off + len]
+        };
+        let kind = |n: usize| Kind::from_u8(nodes[n * NODE + 30]);
+        let node_flags = |n: usize| nodes[n * NODE + 31];
+        let children = |n: usize| {
+            let mut v = Vec::new();
+            let mut c = u32_at(n, 12);
+            while c != NONE && (c as usize) < h.nodes {
+                v.push(c as usize);
+                c = u32_at(c as usize, 16);
+            }
+            // The old tree kept the most recently added child first.
+            v.reverse();
+            v
+        };
+        // Folders an unfinished scan had not read, by path relative to the root.
+        let unread: HashSet<&[u8]> = if h.complete { HashSet::new() } else { pending.split(|&b| b == 0).collect() };
+
+        let tmp = path.with_extension("converting");
+        let root_name = String::from_utf8_lossy(name(0)).into_owned();
+        let store = Store::create(&tmp, &h.root, &root_name, u32_at(0, 24))?;
+        let mut queue: VecDeque<(usize, DirId, Vec<u8>)> = VecDeque::from([(0, 0, Vec::new())]);
+        while let Some((n, dir, rel)) = queue.pop_front() {
+            if unread.contains(rel.as_slice()) {
+                continue;
+            }
+            let kids = children(n);
+            let entries: Vec<NewEntry> = kids
+                .iter()
+                .map(|&c| {
+                    let own = size(c).saturating_sub(children(c).iter().map(|&g| size(g)).sum());
+                    let flags = node_flags(c);
+                    NewEntry {
+                        name: OsStr::from_bytes(name(c)).to_os_string(),
+                        kind: kind(c),
+                        flags,
+                        size: if kind(c) == Kind::Dir { own } else { size(c) },
+                        mtime: u32_at(c, 24),
+                        link: None,
+                        descend: kind(c) == Kind::Dir && flags & flags::PRUNED == 0,
+                    }
+                })
+                .collect();
+            let found = store.add_listing(dir, entries)?;
+            let descended = kids.iter().filter(|&&c| kind(c) == Kind::Dir && node_flags(c) & flags::PRUNED == 0);
+            for (&c, d) in descended.zip(found) {
+                let mut child_rel = rel.clone();
+                if !child_rel.is_empty() {
+                    child_rel.push(b'/');
+                }
+                child_rel.extend_from_slice(name(c));
+                queue.push_back((c, d, child_rel));
+            }
+        }
+        let complete = h.complete;
+        store.checkpoint(complete, Some(UNIX_EPOCH + Duration::from_secs(h.scanned_at)))?;
+        drop(store);
+        std::fs::rename(&tmp, path)
+    }
+}
+
+/// Builds a store from items added one at a time, the way tests of the views describe a
+/// scan.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    struct Added {
+        parent: NodeId,
+        name: Vec<u8>,
+        kind: Kind,
+        flags: u8,
+        size: u64,
+        mtime: u32,
+    }
+
+    pub struct Builder {
+        root: PathBuf,
+        root_name: String,
+        added: Vec<Added>,
+    }
+
+    /// A built store and the store's id for each id that [`Builder::add`] returned.
+    pub struct Built {
+        pub store: Store,
+        ids: Vec<NodeId>,
+    }
+
+    impl Built {
+        pub fn id(&self, added: NodeId) -> NodeId {
+            self.ids[added as usize]
+        }
+
+        /// The id [`Builder::add`] returned for the store's item `id`.
+        pub fn added(&self, id: NodeId) -> NodeId {
+            self.ids.iter().position(|&i| i == id).map_or(NONE, |p| p as NodeId)
+        }
+    }
+
+    impl std::ops::Deref for Built {
+        type Target = Store;
+        fn deref(&self) -> &Store {
+            &self.store
+        }
+    }
+
+    impl Builder {
+        pub fn new(root: &str, root_name: &str) -> Builder {
+            Builder { root: root.into(), root_name: root_name.into(), added: Vec::new() }
+        }
+
+        /// Adds an item below `parent` (0 for the root, otherwise an id returned earlier).
+        /// Folders are read unless they are [`flags::PRUNED`].
+        pub fn add(&mut self, parent: NodeId, name: &[u8], kind: Kind, flags: u8, size: u64, mtime: u32) -> NodeId {
+            self.added.push(Added { parent, name: name.to_vec(), kind, flags, size, mtime });
+            self.added.len() as NodeId
+        }
+
+        /// The child of `parent` named `name`, if one was added.
+        pub fn find_child(&self, parent: NodeId, name: &[u8]) -> Option<NodeId> {
+            self.added.iter().position(|a| a.parent == parent && a.name == name).map(|i| i as NodeId + 1)
+        }
+
+        /// Writes every folder's listing to a file that is deleted at once; the open store
+        /// keeps reading it.
+        pub fn build(&self) -> Built {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::create(&dir.path().join("t.scan"), &self.root, &self.root_name, 0).unwrap();
+            let mut ids = vec![NONE; self.added.len() + 1];
+            ids[0] = ROOT;
+            let mut queue = VecDeque::from([(0 as NodeId, 0 as DirId)]);
+            while let Some((parent, dir)) = queue.pop_front() {
+                let kids: Vec<NodeId> = (1..=self.added.len() as NodeId).filter(|&i| self.added[i as usize - 1].parent == parent).collect();
+                let entries = kids
+                    .iter()
+                    .map(|&k| {
+                        let a = &self.added[k as usize - 1];
+                        NewEntry {
+                            name: OsStr::from_bytes(&a.name).to_os_string(),
+                            kind: a.kind,
+                            flags: a.flags,
+                            size: a.size,
+                            mtime: a.mtime,
+                            link: None,
+                            descend: a.kind == Kind::Dir && a.flags & flags::PRUNED == 0,
+                        }
+                    })
+                    .collect();
+                let found = store.add_listing(dir, entries).unwrap();
+                for (&k, id) in kids.iter().zip(store.children(store.item_of(dir))) {
+                    ids[k as usize] = id;
+                }
+                let descended = kids.iter().filter(|&&k| {
+                    let a = &self.added[k as usize - 1];
+                    a.kind == Kind::Dir && a.flags & flags::PRUNED == 0
+                });
+                for (&k, d) in descended.zip(found) {
+                    queue.push_back((k, d));
+                }
+            }
+            Built { store, ids }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,7 +1714,7 @@ mod tests {
         assert_eq!(s.size(ROOT), 1110);
         assert_eq!(s.display_name(ROOT), "Data");
         assert_eq!(s.path(s.find(Path::new("/data/a/y.txt")).unwrap()), PathBuf::from("/data/a/y.txt"));
-        let names: Vec<String> = s.sorted_children(ROOT).into_iter().map(|c| s.display_name(c)).collect();
+        let names: Vec<String> = s.sorted_children(ROOT).into_iter().map(|c| s.display_name(c).into_owned()).collect();
         assert_eq!(names, ["c.bin", "a", "b"]);
         assert_eq!(s.node(s.find(Path::new("/data/c.bin")).unwrap()).mtime, 7);
         assert!(s.node(a).is_dir());
@@ -1274,8 +1807,7 @@ mod tests {
             // Not grafted yet: the old contents still count and the shadow is not in the tree.
             assert_eq!(s.size(ROOT), 1110);
             assert!(s.find(Path::new("/data/a/x.bin")).is_some());
-            assert!(!s.pending().contains(&inner[0]));
-            assert_eq!(s.pending_in(shadow), vec![inner[0]]);
+            assert!(!s.pending().contains(&inner[0]), "folders of an unfinished rescan are not part of the scan");
             assert_eq!(s.dir_path(inner[0]), PathBuf::from("/data/a/deep"));
             s.add_listing(inner[0], vec![file("d", 1)]).unwrap();
             s.graft(shadow).unwrap();
@@ -1315,7 +1847,8 @@ mod tests {
     fn large_and_many_listings_read_back_through_small_caches() {
         // A folder with more entries than fit in a block, and more blocks than the caches hold.
         let tmp = tempfile::tempdir().unwrap();
-        let s = Store::create(&tmp.path().join("t.scan"), Path::new("/r"), "r", 0).unwrap();
+        let path = tmp.path().join("t.scan");
+        let s = Store::create(&path, Path::new("/r"), "r", 0).unwrap();
         let mut entries: Vec<NewEntry> = (0..20_000).map(|i| file(&format!("f{i}"), i)).collect();
         entries.push(folder("sub"));
         let sub = s.add_listing(0, entries).unwrap()[0];
@@ -1329,9 +1862,12 @@ mod tests {
         s.checkpoint(false, None).unwrap();
         let expected: u64 = (0..20_000u64).sum::<u64>() + 300 * 50;
         assert_eq!(s.size(ROOT), expected);
-        let s = Store::open(s.file()).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
         assert_eq!(s.size(ROOT), expected);
         assert_eq!(s.display_name(s.find(Path::new("/r/f19999")).unwrap()), "f19999");
+        assert_eq!(s.parent(s.find(Path::new("/r/f19999")).unwrap()), ROOT);
+        assert!(s.has_children(ROOT) && !s.has_children(s.find(Path::new("/r/f1")).unwrap()));
         let mut count = 0;
         s.walk(ROOT, |_, _, _| {
             count += 1;
@@ -1344,6 +1880,92 @@ mod tests {
         assert_eq!(top.len(), 3);
         assert_eq!(rest, 20_001 - 3);
         assert_eq!(rest_size + top.iter().map(|&t| s.size(t)).sum::<u64>(), expected);
+    }
+
+    #[test]
+    fn scans_saved_by_the_previous_version_are_converted_on_open() {
+        // Upgrading must not lose a saved scan, finished or not: a whole-disk scan takes long.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = file_for(tmp.path(), Path::new("/old"));
+        // root "Old" -> a/ (f: 100 bytes, folder's own 4096), p/ (not read yet)
+        let mut nodes = Vec::new();
+        let mut names = Vec::new();
+        let mut node = |size: u64, parent: u32, first: u32, next: u32, name: &str, mtime: u32, kind: u8| {
+            let off = names.len() as u32;
+            names.extend_from_slice(name.as_bytes());
+            nodes.extend_from_slice(&size.to_le_bytes());
+            for v in [parent, first, next, off, mtime] {
+                nodes.extend_from_slice(&v.to_le_bytes());
+            }
+            nodes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            nodes.extend_from_slice(&[kind, 0]);
+        };
+        node(4196, NONE, 3, NONE, "Old", 5, 1);
+        node(4196, 0, 2, NONE, "a", 6, 1);
+        node(100, 1, NONE, NONE, "f", 7, 0);
+        node(0, 0, NONE, 1, "p", 8, 1);
+        let pending = b"p".to_vec();
+        let mut header = b"WHATDSK2".to_vec();
+        for v in [1_700_000_000u64, 4196, 4, names.len() as u64, 4, pending.len() as u64, 0, 0] {
+            header.extend_from_slice(&v.to_le_bytes());
+        }
+        header.extend_from_slice(b"/old");
+        let mut stream = nodes.clone();
+        stream.extend_from_slice(&names);
+        stream.extend_from_slice(&pending);
+        header.extend(zstd::encode_all(&stream[..], 1).unwrap());
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&path, header).unwrap();
+
+        // Listed straight away from the old header, before any conversion.
+        let listed = list(tmp.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].total, listed[0].complete), (4196, false));
+
+        let s = load(tmp.path(), Path::new("/old")).unwrap();
+        assert_eq!(s.size(ROOT), 4196);
+        assert_eq!(s.display_name(ROOT), "Old");
+        assert_eq!(s.size(s.find(Path::new("/old/a")).unwrap()), 4196);
+        assert_eq!(s.node(s.find(Path::new("/old/a/f")).unwrap()).mtime, 7);
+        assert_eq!(s.pending().iter().map(|&d| s.dir_path(d)).collect::<Vec<_>>(), vec![PathBuf::from("/old/p")]);
+        assert_eq!(s.summary().scanned_at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        drop(s);
+        assert!(!old_format::is_old(&path), "converted in place");
+        assert_eq!(Store::open(&path).unwrap().size(ROOT), 4196);
+    }
+
+    #[test]
+    fn small_listings_never_share_a_block_with_a_huge_one() {
+        // A block is read whole. Small folders written next to one with hundreds of
+        // thousands of items made every read of them unpack megabytes: a walk over a scan
+        // took 30 s instead of 1.5 s.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::create(&tmp.path().join("t.scan"), Path::new("/r"), "r", 0).unwrap();
+        let found = s.add_listing(0, vec![folder("small"), folder("huge"), folder("after")]).unwrap();
+        s.add_listing(found[0], vec![file("x", 1)]).unwrap();
+        let huge: Vec<NewEntry> = (0..5000).map(|i| file(&format!("a-long-file-name-{i:08}"), 1)).collect();
+        s.add_listing(found[1], huge).unwrap();
+        s.add_listing(found[2], vec![file("y", 1)]).unwrap();
+        let block = |d: DirId| s.state.read().dirs[d as usize].loc >> IN_BLOCK_BITS;
+        assert_ne!(block(found[0]), block(found[1]));
+        assert_ne!(block(found[2]), block(found[1]));
+        assert_eq!(s.size(ROOT), 5002);
+    }
+
+    #[test]
+    fn a_huge_listing_is_kept_while_used_and_freed_after() {
+        // Browsing a folder with hundreds of thousands of items reads it once, but its
+        // listing (tens of megabytes) must not stay in memory after the user moved on.
+        let mut c: Cache<u32> = Cache::new(100, true);
+        c.insert(1, 7, 1000);
+        assert_eq!(c.get(1), Some(7));
+        c.trim(Duration::from_secs(60));
+        assert_eq!(c.get(1), Some(7), "still in use");
+        c.trim(Duration::ZERO);
+        assert_eq!(c.get(1), None);
+        let mut blocks: Cache<u32> = Cache::new(100, false);
+        blocks.insert(1, 7, 1000);
+        assert_eq!(blocks.get(1), None, "huge blocks are not kept at all");
     }
 
     #[test]

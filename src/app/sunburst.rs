@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 use super::state::use_app_state;
 use super::{SessionRef, format};
-use crate::tree::{NodeId, ROOT, Tree};
+use crate::store::{NodeId, ROOT, Store};
 
 const RINGS: usize = 4;
 const INNER: f64 = 30.0;
@@ -24,7 +24,7 @@ pub struct Segment {
 }
 
 /// Lays out the subtree of `center` over `total` bytes (at least the size of `center`).
-pub fn layout(tree: &Tree, center: NodeId, total: u64) -> Vec<Segment> {
+pub fn layout(tree: &Store, center: NodeId, total: u64) -> Vec<Segment> {
     let mut out = Vec::new();
     if total > 0 {
         place(tree, center, 0.0, TAU * tree.size(center) as f64 / total as f64, 1, &mut out);
@@ -32,7 +32,7 @@ pub fn layout(tree: &Tree, center: NodeId, total: u64) -> Vec<Segment> {
     out
 }
 
-fn place(tree: &Tree, parent: NodeId, start: f64, span: f64, depth: usize, out: &mut Vec<Segment>) {
+fn place(tree: &Store, parent: NodeId, start: f64, span: f64, depth: usize, out: &mut Vec<Segment>) {
     let parent_size = tree.size(parent);
     if parent_size == 0 || depth > RINGS {
         return;
@@ -112,7 +112,7 @@ pub fn Sunburst(
     // Components that read a tree must re-render when background work changes it.
     let _ = (state.rev)();
     let mut hover = use_signal(|| None::<Hover>);
-    let tree = session.tree.read();
+    let tree = session.store();
     let complete = session.is_complete();
     let unaccounted = (center == ROOT && complete)
         .then(|| state.volume_of(&session.root))
@@ -123,7 +123,7 @@ pub fn Sunburst(
     let highlight_path = highlighted.map(|h| tree.ancestry(h)).unwrap_or_default();
     let center_name = tree.display_name(center).into_owned();
     let center_size = tree.size(center);
-    let parent = tree.node(center).parent;
+    let parent = tree.parent(center);
     let names: Vec<(String, u32)> = segments
         .iter()
         .map(|s| (tree.display_name(s.id).into_owned(), tree.node(s.id).mtime))
@@ -138,7 +138,7 @@ pub fn Sunburst(
     let select_session = session.clone();
     let select = use_callback(move |id: NodeId| {
         let sel = {
-            let tree = select_session.tree.read();
+            let tree = select_session.store();
             let chain = tree.ancestry(id);
             let start = chain.iter().position(|&a| a == view_root).map_or(chain.len(), |p| p + 1);
             chain[start..].to_vec()
@@ -205,7 +205,7 @@ pub fn Sunburst(
 fn HoverCard(hover: Hover, session: SessionRef, window_width: f64) -> Element {
     let _ = (use_app_state().rev)();
     // Look the size up at render time so it stays live during a scan.
-    let size = hover.id.map_or(hover.size, |id| session.tree.read().size(id));
+    let size = hover.id.map_or(hover.size, |id| session.store().size(id));
     let left = if hover.x + 260.0 > window_width { hover.x - 250.0 } else { hover.x + 14.0 };
     rsx! {
         div { class: "hover-card", style: "left: {left}px; top: {hover.y + 14.0}px",
@@ -234,16 +234,18 @@ fn ellipsize(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Kind;
+    use crate::store::Kind;
+    use crate::store::testing::Builder;
 
     #[test]
     fn segment_angles_are_proportional_to_size() {
         // The chart is only useful if a segment's share of the circle is its share of the
         // space.
-        let mut t = Tree::new("/r".into(), "r", 0);
-        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
-        t.add(a, b"x", Kind::File, 0, 300, 0);
-        t.add(ROOT, b"b", Kind::File, 0, 100, 0);
+        let mut b = Builder::new("/r", "r");
+        let a = b.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
+        b.add(a, b"x", Kind::File, 0, 300, 0);
+        b.add(ROOT, b"b", Kind::File, 0, 100, 0);
+        let t = b.build();
         let segs = layout(&t, ROOT, t.size(ROOT));
         let span = |name: &[u8]| {
             let s = segs.iter().find(|s| t.name(s.id).as_encoded_bytes() == name).unwrap();
@@ -257,8 +259,9 @@ mod tests {
 
     #[test]
     fn unaccounted_space_shrinks_the_scanned_part_of_the_circle() {
-        let mut t = Tree::new("/r".into(), "r", 0);
-        t.add(ROOT, b"b", Kind::File, 0, 100, 0);
+        let mut b = Builder::new("/r", "r");
+        b.add(ROOT, b"b", Kind::File, 0, 100, 0);
+        let t = b.build();
         let segs = layout(&t, ROOT, 400);
         assert!((segs[0].end - TAU * 0.25).abs() < 1e-9);
     }
@@ -282,9 +285,10 @@ mod tests {
 
     #[test]
     fn tiny_items_are_not_drawn() {
-        let mut t = Tree::new("/r".into(), "r", 0);
-        t.add(ROOT, b"big", Kind::File, 0, 1_000_000, 0);
-        t.add(ROOT, b"tiny", Kind::File, 0, 1, 0);
+        let mut b = Builder::new("/r", "r");
+        b.add(ROOT, b"big", Kind::File, 0, 1_000_000, 0);
+        b.add(ROOT, b"tiny", Kind::File, 0, 1, 0);
+        let t = b.build();
         assert_eq!(layout(&t, ROOT, t.size(ROOT)).len(), 1);
     }
 }

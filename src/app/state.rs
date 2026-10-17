@@ -10,11 +10,10 @@ use dioxus::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
 use crate::brew::{self, Brew};
-use crate::cache;
 use crate::dev::Language;
 use crate::locations::Locations;
-use crate::scan::{self, CountedLinks, Outcome, Progress};
-use crate::tree::{NodeId, ROOT, Tree, flags};
+use crate::scan::{self, Outcome, Progress};
+use crate::store::{self, DirId, NodeId, ROOT, Store, flags};
 use crate::volumes::{self, Boundary, Volume};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,24 +25,20 @@ pub enum Busy {
     Rescanning(NodeId),
 }
 
-/// One scanned root: its tree and the state of work on it.
+/// One scanned root: its store and the state of work on it.
 pub struct Session {
     pub root: PathBuf,
-    pub tree: RwLock<Tree>,
+    /// An empty placeholder until a saved scan has loaded.
+    store: RwLock<Arc<Store>>,
     pub progress: Progress,
     /// Asks a running scan to pause, or a folder rescan to stop, after the folders it is
     /// reading.
     pub stop: AtomicBool,
     pub busy: Mutex<Busy>,
-    /// When the tree was last scanned completely; for an unfinished scan, when it started.
-    /// `None` before the first scan.
+    /// When the scan last finished; for an unfinished scan, when it started. `None` before
+    /// the first scan.
     pub scanned_at: Mutex<Option<SystemTime>>,
-    /// Folders a paused scan still has to read. Empty once the scan is complete, and while
-    /// a scan runs, since the scan holds them.
-    pub pending: Mutex<Vec<NodeId>>,
-    /// Hard links a paused scan has counted, so continuing it does not count them again.
-    pub counted: Mutex<CountedLinks>,
-    /// Incremented by background threads whenever they finish changing the tree.
+    /// Incremented by background threads whenever they finish changing the store.
     pub version: AtomicU64,
 }
 
@@ -51,28 +46,35 @@ impl Session {
     pub(super) fn new(root: &Path, name: &str) -> Self {
         Session {
             root: root.to_path_buf(),
-            tree: RwLock::new(Tree::new(root.to_path_buf(), name, 0)),
+            store: RwLock::new(Arc::new(Store::placeholder(root, name))),
             progress: Progress::default(),
             stop: AtomicBool::new(false),
             busy: Mutex::new(Busy::Idle),
             scanned_at: Mutex::new(None),
-            pending: Mutex::new(Vec::new()),
-            counted: Mutex::new(CountedLinks::new()),
             version: AtomicU64::new(0),
         }
+    }
+
+    pub fn store(&self) -> Arc<Store> {
+        self.store.read().clone()
+    }
+
+    pub(super) fn set_store(&self, store: Store) {
+        *self.store.write() = Arc::new(store);
     }
 
     pub fn busy(&self) -> Busy {
         *self.busy.lock()
     }
 
+    /// A scan that stopped before reading everything and can continue.
     pub fn is_paused(&self) -> bool {
-        !self.pending.lock().is_empty()
+        self.scanned_at.lock().is_some() && !self.store().complete()
     }
 
-    /// The tree holds a whole, finished scan.
+    /// The store holds a whole, finished scan.
     pub fn is_complete(&self) -> bool {
-        self.busy() == Busy::Idle && self.scanned_at.lock().is_some() && !self.is_paused()
+        self.busy() == Busy::Idle && self.scanned_at.lock().is_some() && self.store().complete()
     }
 
     fn finish(&self) {
@@ -80,12 +82,10 @@ impl Session {
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Writes the tree to the cache; failures only cost a rescan next time. Must not be
-    /// called by others while a scan runs: the scan holds the folders it still has to read,
-    /// so the cache would record the partial tree as complete.
-    pub fn save(&self) {
-        if let Some(at) = *self.scanned_at.lock() {
-            let _ = cache::save(&cache::dir(), &self.tree.read(), at, &self.pending.lock(), &self.counted.lock());
+    /// Writes everything recorded so far. A failure is shown from [`Store::write_error`].
+    fn save(&self, complete: bool, scanned_at: Option<SystemTime>) {
+        if let Err(e) = self.store().checkpoint(complete, scanned_at) {
+            eprintln!("could not save the scan of {}: {e}", self.root.display());
         }
     }
 }
@@ -97,32 +97,29 @@ const CHECKPOINT: Duration = Duration::from_secs(120);
 /// are gone, so they are tracked here.
 static RUNNING: Mutex<Vec<Arc<Session>>> = Mutex::new(Vec::new());
 
-/// Scans `folders` of the session's tree in the background until it is complete or paused.
-fn spawn_scan(session: Arc<Session>, folders: Vec<NodeId>) {
+/// Scans `folders` of the session's store in the background until it is complete or paused.
+fn spawn_scan(session: Arc<Session>, folders: Vec<DirId>) {
     *session.busy.lock() = Busy::Scanning;
     RUNNING.lock().push(session.clone());
     std::thread::spawn(move || {
+        let store = session.store();
         let boundary = Boundary::new(&session.root);
         let mut folders = folders;
-        let mut counted = std::mem::take(&mut *session.counted.lock());
         loop {
             let deadline = Some(Instant::now() + CHECKPOINT);
-            let outcome = scan::scan(&session.tree, &boundary, &session.progress, &session.stop, folders, deadline, &mut counted);
-            match outcome {
+            match scan::scan(&store, &boundary, &session.progress, &session.stop, folders, deadline) {
                 Outcome::Complete => {
-                    *session.scanned_at.lock() = Some(SystemTime::now());
-                    session.save();
+                    let now = SystemTime::now();
+                    *session.scanned_at.lock() = Some(now);
+                    session.save(true, Some(now));
                     break;
                 }
-                Outcome::Paused(rest) => {
-                    *session.pending.lock() = rest;
-                    *session.counted.lock() = counted;
-                    session.save();
+                Outcome::Paused => {
+                    session.save(false, None);
                     if session.stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    folders = std::mem::take(&mut *session.pending.lock());
-                    counted = std::mem::take(&mut *session.counted.lock());
+                    folders = store.pending();
                 }
             }
         }
@@ -216,7 +213,7 @@ pub struct AppState {
     pub locations: Signal<Vec<Location>>,
     pub selected: Signal<PathBuf>,
     pub sessions: Signal<HashMap<PathBuf, Arc<Session>>>,
-    pub summaries: Signal<HashMap<PathBuf, cache::Summary>>,
+    pub summaries: Signal<HashMap<PathBuf, store::Summary>>,
     /// Bumped whenever any tree changes, so components that read trees re-render.
     pub rev: Signal<u64>,
     pub view: Signal<View>,
@@ -244,7 +241,7 @@ pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into())
 }
 
-pub fn default_locations(summaries: &HashMap<PathBuf, cache::Summary>) -> Vec<Location> {
+pub fn default_locations(summaries: &HashMap<PathBuf, store::Summary>) -> Vec<Location> {
     let home = home_dir();
     let mut v = vec![Location {
         name: volumes::display_name(&home),
@@ -311,7 +308,7 @@ impl AppState {
         candidates.sort_by_key(|s| std::cmp::Reverse(s.root.components().count()));
         candidates
             .into_iter()
-            .find_map(|s| s.tree.read().find(path).map(|id| (s.clone(), id)))
+            .find_map(|s| s.store().find(path).map(|id| (s.clone(), id)))
     }
 
     /// Cached root that can show `path`: its own scan, else the closest enclosing one.
@@ -342,27 +339,23 @@ impl AppState {
         *session.busy.lock() = Busy::Loading;
         self.sessions.write().insert(root.clone(), session.clone());
         std::thread::spawn(move || {
-            match cache::load(&cache::dir(), &root) {
-                Ok((tree, summary, pending, counted)) => {
+            match store::load(&store::dir(), &root) {
+                Ok(store) => {
                     // A continued scan counts on from the items it already found.
-                    let found = tree.parts().0.len() as u64 - 1;
-                    session.progress.files.store(found, Ordering::Relaxed);
-                    *session.tree.write() = tree;
-                    *session.scanned_at.lock() = Some(summary.scanned_at);
-                    *session.pending.lock() = pending;
-                    *session.counted.lock() = counted;
+                    session.progress.files.store(store.items().saturating_sub(1), Ordering::Relaxed);
+                    *session.scanned_at.lock() = Some(store.summary().scanned_at);
+                    session.set_store(store);
                 }
-                // An unreadable cache is treated as "not scanned"; the next scan replaces it.
-                Err(_) => {
-                    let _ = cache::remove(&cache::dir(), &root);
-                }
+                // Shown as not scanned; the file stays, since a scan that took hours must not
+                // be deleted over an error, and the next scan replaces it.
+                Err(e) => eprintln!("could not open the saved scan of {}: {e}", root.display()),
             }
             session.finish();
         });
     }
 
     /// Starts a full scan of `path`, replacing any previous result for it. Does nothing while
-    /// `path` is being scanned: both scans would save to the same cache.
+    /// `path` is being scanned: both scans would write the same file.
     pub fn start_scan(mut self, path: &Path) {
         let running = self
             .sessions
@@ -376,10 +369,15 @@ impl AppState {
             .location(path)
             .map_or_else(|| volumes::display_name(path), |l| l.name);
         let session = Arc::new(Session::new(path, &name));
+        let file = store::file_for(&store::dir(), path);
+        let store = Store::create(&file, path, &name, scan::mtime_of_path(path))
+            // Without a file (a full disk, for example) the scan is kept in memory.
+            .unwrap_or_else(|e| Store::in_memory(path, &name, &e.to_string()));
+        session.set_store(store);
         *session.scanned_at.lock() = Some(SystemTime::now());
         self.sessions.write().insert(path.to_path_buf(), session.clone());
         self.view.set(View::default());
-        spawn_scan(session, vec![ROOT]);
+        spawn_scan(session, vec![0]);
     }
 
     /// Continues a paused scan with the folders it has not read yet.
@@ -387,13 +385,14 @@ impl AppState {
         if session.busy() != Busy::Idle {
             return;
         }
-        let folders = std::mem::take(&mut *session.pending.lock());
+        let folders = session.store().pending();
         if !folders.is_empty() {
             spawn_scan(session, folders);
         }
     }
 
-    /// Rescans one folder of an existing scan and replaces its contents.
+    /// Rescans one folder of an existing scan and replaces its contents once done; until
+    /// then the old contents stay visible.
     pub fn rescan_folder(self, session: Arc<Session>, id: NodeId) {
         if id == ROOT {
             self.start_scan(&session.root);
@@ -402,36 +401,18 @@ impl AppState {
         if session.busy() != Busy::Idle {
             return;
         }
-        let (path, name) = {
-            let t = session.tree.read();
-            (t.path(id), t.display_name(id).into_owned())
-        };
         *session.busy.lock() = Busy::Rescanning(id);
         std::thread::spawn(move || {
-            let sub = RwLock::new(Tree::new(path, &name, 0));
-            let boundary = Boundary::new(&session.root);
-            let outcome = scan::scan(
-                &sub,
-                &boundary,
-                &Progress::default(),
-                &session.stop,
-                vec![ROOT],
-                None,
-                &mut CountedLinks::new(),
-            );
-            session.stop.store(false, Ordering::Relaxed);
-            // A stopped rescan keeps the folder's previous contents.
-            if outcome == Outcome::Complete {
-                let sub = sub.into_inner();
-                let mut tree = session.tree.write();
-                if tree.is_attached(id) {
-                    tree.graft(id, &sub);
+            let store = session.store();
+            if let Ok(Some(shadow)) = store.shadow(id) {
+                let boundary = Boundary::new(&session.root);
+                let outcome = scan::scan(&store, &boundary, &Progress::default(), &session.stop, vec![shadow], None);
+                // A stopped rescan keeps the folder's previous contents.
+                if outcome == Outcome::Complete && store.graft(shadow).is_ok() {
+                    session.save(store.complete(), None);
                 }
-                drop(tree);
-                // In a paused scan the folder is now read; folders below it were replaced.
-                session.pending.lock().retain(|&p| p != id);
-                session.save();
             }
+            session.stop.store(false, Ordering::Relaxed);
             session.finish();
         });
     }
@@ -445,33 +426,25 @@ impl AppState {
 
     /// Drops paths that were deleted on disk from every loaded scan that contains them, so
     /// overlapping scans (a volume and a folder on it) stay consistent, and saves those scans.
-    /// A running scan saves the change itself when it pauses or finishes.
     pub fn forget_paths(mut self, paths: &[PathBuf]) {
         let sessions: Vec<Arc<Session>> = self.sessions.peek().values().cloned().collect();
         for session in sessions {
-            let changed = {
-                let mut tree = session.tree.write();
-                let ids: Vec<NodeId> = paths
-                    .iter()
-                    .filter_map(|p| tree.find(p))
-                    .filter(|&id| id != ROOT)
-                    .collect();
-                for &id in &ids {
-                    tree.remove(id);
-                }
-                !ids.is_empty()
-            };
-            if changed && session.busy() != Busy::Scanning {
+            let store = session.store();
+            let ids: Vec<NodeId> = paths.iter().filter_map(|p| store.find(p)).filter(|&id| id != ROOT).collect();
+            for &id in &ids {
+                let _ = store.remove(id);
+            }
+            if !ids.is_empty() {
                 std::thread::spawn(move || {
-                    session.save();
+                    session.save(session.store().complete(), None);
                     // Lets the sidebar pick up the new total from the saved scan.
                     session.version.fetch_add(1, Ordering::Relaxed);
                 });
             }
         }
         if let Some((session, _)) = self.resolve(&self.selected.peek().clone()) {
-            let tree = session.tree.read();
-            self.view.with_mut(|v| v.checked.retain(|&id| tree.is_attached(id)));
+            let store = session.store();
+            self.view.with_mut(|v| v.checked.retain(|&id| store.is_attached(id)));
         }
         self.dev_checked.with_mut(|c| c.retain(|p| !paths.contains(p)));
         self.rev.with_mut(|r| *r += 1);
@@ -518,7 +491,7 @@ impl AppState {
 
     /// Re-reads cache summaries and volume capacities after background work finished.
     pub fn refresh_disk_info(mut self) {
-        let summaries: HashMap<PathBuf, cache::Summary> = cache::list(&cache::dir())
+        let summaries: HashMap<PathBuf, store::Summary> = store::list(&store::dir())
             .into_iter()
             .map(|s| (s.root.clone(), s))
             .collect();
@@ -536,9 +509,9 @@ impl AppState {
     }
 }
 
-/// Changes when lists computed from the trees should be recomputed: on every change while
-/// idle, but at most every two seconds while a scan runs, since walking millions of nodes
-/// four times a second would stall the interface.
+/// Changes when lists computed from the scans should be recomputed: on every change while
+/// idle, but at most every ten seconds while a scan runs. Lists are computed by reading the
+/// scans from disk, which takes seconds for a whole disk.
 pub fn use_list_trigger(state: AppState) -> Memo<(bool, u64)> {
     use_memo(move || {
         let rev = (state.rev)();
@@ -547,13 +520,24 @@ pub fn use_list_trigger(state: AppState) -> Memo<(bool, u64)> {
             .peek()
             .values()
             .any(|s| matches!(s.busy(), Busy::Scanning | Busy::Rescanning(_)));
-        if busy { (true, rev / 8) } else { (false, rev) }
+        if busy { (true, rev / 40) } else { (false, rev) }
     })
+}
+
+/// One list computation at a time.
+static LIST_WORK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Runs `work`, which reads scans from disk, on a background thread after any computation
+/// still running. A list asked for again meanwhile waits here, and is dropped if it is
+/// replaced, so computations queue instead of piling up.
+pub async fn run_list_work<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let _turn = LIST_WORK.lock().await;
+    tokio::task::spawn_blocking(work).await.ok()
 }
 
 /// Checked items, without items whose ancestor is also checked (deleting the ancestor
 /// deletes them too) and without items that no longer exist.
-pub fn effective_checked(tree: &Tree, checked: &BTreeSet<NodeId>) -> Vec<NodeId> {
+pub fn effective_checked(tree: &Store, checked: &BTreeSet<NodeId>) -> Vec<NodeId> {
     checked
         .iter()
         .copied()
@@ -566,27 +550,30 @@ pub fn effective_checked(tree: &Tree, checked: &BTreeSet<NodeId>) -> Vec<NodeId>
 }
 
 /// Items that must never be offered for deletion.
-pub fn is_protected(tree: &Tree, id: NodeId) -> bool {
+pub fn is_protected(tree: &Store, id: NodeId) -> bool {
     id == ROOT || tree.node(id).has(flags::PRUNED)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Kind;
+    use crate::store::Kind;
+    use crate::store::testing::Builder;
 
     #[test]
     fn checking_a_folder_and_its_contents_counts_the_contents_once() {
         // The removal total must equal the space actually freed, so items inside a checked
         // folder must not be added again.
-        let mut t = Tree::new("/r".into(), "r", 0);
-        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
-        let inner = t.add(a, b"inner", Kind::File, 0, 10, 0);
-        let other = t.add(ROOT, b"other", Kind::File, 0, 5, 0);
+        let mut b = Builder::new("/r", "r");
+        let a = b.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
+        let inner = b.add(a, b"inner", Kind::File, 0, 10, 0);
+        let other = b.add(ROOT, b"other", Kind::File, 0, 5, 0);
+        let t = b.build();
+        let (a, inner, other) = (t.id(a), t.id(inner), t.id(other));
         let checked: BTreeSet<NodeId> = [a, inner, other].into();
         assert_eq!(effective_checked(&t, &checked), vec![a, other]);
 
-        t.remove(other);
+        t.remove(other).unwrap();
         assert_eq!(effective_checked(&t, &checked), vec![a]);
     }
 }

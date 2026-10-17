@@ -1,14 +1,13 @@
-//! Parallel, resumable scan of a directory into a [`Tree`].
+//! Parallel, resumable scan of a directory into a [`Store`].
 //!
 //! Worker threads read one folder at a time with `dua-core`'s native reader, which uses
 //! `getattrlistbulk` to return names and sizes for a whole folder per system call. One thread
-//! applies each folder's listing to the shared tree, so the UI can show live totals, and
-//! queues the subfolders it finds. Because a folder counts as read only once its listing is
-//! applied, a scan can stop at any time and later continue with exactly the folders that are
-//! still queued. Stopping abandons folders being read, so a pause does not wait for a folder
+//! records each folder's listing in the [`Store`], so the UI can show live totals, and queues
+//! the subfolders it finds. Because a folder counts as read only once its listing is
+//! recorded, a scan can stop at any time and later continue with the store's pending
+//! folders. Stopping abandons folders being read, so a pause does not wait for a folder
 //! with hundreds of thousands of items; they are read again when the scan continues.
 
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -19,9 +18,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use dua_core::Options;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
 
-use crate::tree::{Kind, NodeId, ROOT, Tree, flags};
+use crate::store::{DirId, Kind, NewEntry, Store, flags};
 use crate::volumes::Boundary;
 
 #[derive(Default)]
@@ -32,48 +31,35 @@ pub struct Progress {
     pub errors: AtomicU64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Complete,
-    /// Stopped early. These folders were found but not read yet; scanning them continues
-    /// the scan.
-    Paused(Vec<NodeId>),
+    /// Stopped early; the store's pending folders are still to be read.
+    Paused,
 }
-
-/// Hard links already counted, kept across pauses of one scan: (device, inode).
-pub type CountedLinks = HashSet<(u64, u64)>;
 
 /// How long the applying thread waits for listings before checking whether to stop.
 const POLL: Duration = Duration::from_millis(50);
 
-/// Reads the folders `folders` of `tree` and everything below them that `boundary` allows.
-/// Pass `vec![ROOT]` for a new scan, or a previous [`Outcome::Paused`] list to continue one.
+/// Reads the folders `folders` of `store` and everything below them that `boundary` allows.
+/// Pass the root folder (0) for a new scan, or [`Store::pending`] to continue one.
 /// Stops soon after `stop` is set, or after `deadline` once at least one folder was read and
 /// the folders being read are finished: a folder abandoned at every deadline would never be
 /// read completely.
 pub fn scan(
-    tree: &RwLock<Tree>,
+    store: &Store,
     boundary: &Boundary,
     progress: &Progress,
     stop: &AtomicBool,
-    folders: Vec<NodeId>,
+    folders: Vec<DirId>,
     deadline: Option<Instant>,
-    counted: &mut CountedLinks,
 ) -> Outcome {
-    let jobs: Vec<(NodeId, PathBuf)> = {
-        let mut t = tree.write();
-        if folders.contains(&ROOT) && t.node(ROOT).first_child == crate::tree::NONE {
-            let mtime = std::fs::symlink_metadata(t.root_path()).ok().map_or(0, |m| mtime_of(&m));
-            t.set_mtime(ROOT, mtime);
-        }
-        // Folders removed while the scan was paused are not read.
-        folders.into_iter().filter(|&id| t.is_attached(id)).map(|id| (id, t.path(id))).collect()
-    };
+    let jobs: Vec<(DirId, PathBuf)> = folders.into_iter().map(|d| (d, store.dir_path(d))).collect();
     let queue = Mutex::new(Queue { jobs, busy: 0, closed: false });
     let ready = Condvar::new();
     let (tx, rx) = mpsc::channel::<Listing>();
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let mut applier = Applier { boundary, progress, counted };
+    let applier = Applier { store, boundary, progress };
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -100,10 +86,10 @@ pub fn scan(
             };
             let listings: Vec<Listing> = std::iter::once(first).chain(rx.try_iter()).collect();
             let mut found = Vec::new();
-            {
-                let mut t = tree.write();
-                for listing in &listings {
-                    applier.apply(&mut t, listing, &mut found);
+            for listing in &listings {
+                if applier.apply(listing, &mut found).is_err() {
+                    // The scan file cannot grow any further.
+                    stop.store(true, Ordering::Relaxed);
                 }
             }
             applied_any = true;
@@ -116,29 +102,24 @@ pub fn scan(
         queue.lock().closed = true;
         ready.notify_all();
     });
-    // Every worker has finished: apply what they read last, so no read folder is lost.
+    // Every worker has finished: record what they read last, so no read folder is lost.
     let mut found = Vec::new();
-    {
-        let mut t = tree.write();
-        for listing in rx.try_iter() {
-            applier.apply(&mut t, &listing, &mut found);
-        }
+    for listing in rx.try_iter() {
+        let _ = applier.apply(&listing, &mut found);
     }
-    let mut pending: Vec<NodeId> = queue.into_inner().jobs.into_iter().map(|(id, _)| id).collect();
-    pending.extend(found.into_iter().map(|(id, _)| id));
-    if pending.is_empty() { Outcome::Complete } else { Outcome::Paused(pending) }
+    if queue.into_inner().jobs.is_empty() && found.is_empty() { Outcome::Complete } else { Outcome::Paused }
 }
 
 struct Queue {
     /// Folders found but not read yet.
-    jobs: Vec<(NodeId, PathBuf)>,
+    jobs: Vec<(DirId, PathBuf)>,
     /// Folders taken by a worker whose listing is not applied yet.
     busy: usize,
     closed: bool,
 }
 
 struct Listing {
-    dir: NodeId,
+    dir: DirId,
     path: PathBuf,
     /// `None` if reading was abandoned because the scan stopped.
     items: Option<io::Result<Vec<Item>>>,
@@ -157,6 +138,11 @@ struct Meta {
     ino: u64,
     nlink: u64,
     mtime: u32,
+}
+
+/// Modification time of `path` in seconds since the epoch, 0 if unknown.
+pub fn mtime_of_path(path: &Path) -> u32 {
+    std::fs::symlink_metadata(path).ok().map_or(0, |m| mtime_of(&m))
 }
 
 fn mtime_of(m: &std::fs::Metadata) -> u32 {
@@ -241,23 +227,29 @@ fn read_folder(path: &Path, stop: &AtomicBool) -> Option<io::Result<Vec<Item>>> 
 }
 
 struct Applier<'a> {
+    store: &'a Store,
     boundary: &'a Boundary,
     progress: &'a Progress,
-    counted: &'a mut CountedLinks,
 }
 
 impl Applier<'_> {
-    /// Adds a folder's entries to the tree and returns the subfolders to read in `found`.
-    fn apply(&mut self, tree: &mut Tree, listing: &Listing, found: &mut Vec<(NodeId, PathBuf)>) {
+    /// Records a folder's entries and returns the subfolders to read in `found`. A folder that
+    /// could not be read counts as read and empty, so it is not retried forever.
+    fn apply(&self, listing: &Listing, found: &mut Vec<(DirId, PathBuf)>) -> io::Result<()> {
         let Some(items) = &listing.items else {
             // Abandoned: the folder still has to be read.
             found.push((listing.dir, listing.path.clone()));
-            return;
+            return Ok(());
         };
-        let Ok(items) = items else {
-            self.progress.errors.fetch_add(1, Ordering::Relaxed);
-            return;
+        let items: &[Item] = match items {
+            Ok(items) => items,
+            Err(_) => {
+                self.progress.errors.fetch_add(1, Ordering::Relaxed);
+                &[]
+            }
         };
+        let mut entries = Vec::with_capacity(items.len());
+        let mut descended = Vec::new();
         for item in items {
             if self.boundary.excludes(&listing.path, &item.name) {
                 continue;
@@ -272,27 +264,27 @@ impl Applier<'_> {
             }
             let Some(meta) = &item.meta else {
                 self.progress.errors.fetch_add(1, Ordering::Relaxed);
-                tree.add(listing.dir, name, item.kind, node_flags, 0, 0);
+                entries.push(NewEntry { name: item.name.clone(), kind: item.kind, flags: node_flags, size: 0, mtime: 0, link: None, descend: false });
                 continue;
             };
             let mut size = meta.size;
-            if item.kind == Kind::File && meta.nlink > 1 && !self.counted.insert((meta.dev, meta.ino)) {
-                size = 0;
-                node_flags |= flags::HARDLINK;
-            }
             let descend = item.kind == Kind::Dir && self.boundary.allows_device(meta.dev);
             if item.kind == Kind::Dir && !descend {
                 // A mount point of another volume; its contents belong to that volume.
                 size = 0;
                 node_flags |= flags::PRUNED;
             }
-            let id = tree.add(listing.dir, name, item.kind, node_flags, size, meta.mtime);
+            let link = (item.kind == Kind::File && meta.nlink > 1).then_some((meta.dev, meta.ino));
             if descend {
-                found.push((id, listing.path.join(&item.name)));
+                descended.push(listing.path.join(&item.name));
             }
+            entries.push(NewEntry { name: item.name.clone(), kind: item.kind, flags: node_flags, size, mtime: meta.mtime, link, descend });
             let counter = if item.kind == Kind::Dir { &self.progress.dirs } else { &self.progress.files };
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        let dirs = self.store.add_listing(listing.dir, entries)?;
+        found.extend(dirs.into_iter().zip(descended));
+        Ok(())
     }
 }
 
@@ -320,23 +312,28 @@ fn is_package(name: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn scan_dir(dir: &Path) -> Tree {
-        let tree = RwLock::new(Tree::new(dir.to_path_buf(), "root", 0));
-        let boundary = Boundary::new(dir);
-        let stop = AtomicBool::new(false);
-        let outcome = scan(&tree, &boundary, &Progress::default(), &stop, vec![ROOT], None, &mut CountedLinks::new());
+    use crate::store::ROOT;
+
+    /// A store whose file is deleted at once; the store keeps reading it.
+    fn new_store(root: &Path) -> Store {
+        let files = tempfile::tempdir().unwrap();
+        Store::create(&files.path().join("t.scan"), root, "root", 0).unwrap()
+    }
+
+    fn scan_dir(dir: &Path) -> Store {
+        let store = new_store(dir);
+        let outcome = scan(&store, &Boundary::new(dir), &Progress::default(), &AtomicBool::new(false), vec![0], None);
         assert_eq!(outcome, Outcome::Complete);
-        tree.into_inner()
+        store
     }
 
     /// Every path below the root with its size, for comparing two scans.
-    fn listing(t: &Tree) -> Vec<(PathBuf, u64)> {
-        let mut out = Vec::new();
-        let mut stack = vec![ROOT];
-        while let Some(id) = stack.pop() {
-            out.push((t.path(id), t.size(id)));
-            stack.extend(t.children(id));
-        }
+    fn listing(s: &Store) -> Vec<(PathBuf, u64)> {
+        let mut out = vec![(s.path(ROOT), s.size(ROOT))];
+        s.walk(ROOT, |id, node, _| {
+            out.push((s.path(id), node.size));
+            true
+        });
         out.sort();
         out
     }
@@ -437,11 +434,31 @@ mod tests {
         // Stopped before anything was read, nothing is applied and the root is still to read.
         let tmp = fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
+        let store = new_store(&root);
         let stop = AtomicBool::new(true);
-        let outcome = scan(&tree, &Boundary::new(&root), &Progress::default(), &stop, vec![ROOT], None, &mut CountedLinks::new());
-        assert_eq!(outcome, Outcome::Paused(vec![ROOT]));
-        assert_eq!(tree.read().children(ROOT).count(), 0);
+        let outcome = scan(&store, &Boundary::new(&root), &Progress::default(), &stop, vec![0], None);
+        assert_eq!(outcome, Outcome::Paused);
+        assert_eq!(store.pending(), vec![0]);
+        assert_eq!(store.children(ROOT).count(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_folder_counts_as_read_and_empty() {
+        // Otherwise a folder without permission would stay pending, and every resumed scan
+        // would try it again and never be complete.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root.join("locked/secret"), 10);
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = new_store(&root);
+        let progress = Progress::default();
+        let outcome = scan(&store, &Boundary::new(&root), &progress, &AtomicBool::new(false), vec![0], None);
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(outcome, Outcome::Complete);
+        assert!(store.pending().is_empty());
+        assert_eq!(store.children(store.find(&root.join("locked")).unwrap()).count(), 0);
+        assert_eq!(progress.errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -462,49 +479,44 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let whole = scan_dir(&root);
 
-        let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
+        let store = new_store(&root);
         let boundary = Boundary::new(&root);
         let stop = AtomicBool::new(false);
-        let mut counted = CountedLinks::new();
-        let mut folders = vec![ROOT];
+        let mut folders = vec![0];
         let mut rounds = 0;
         loop {
             rounds += 1;
-            // A deadline in the past pauses after the first listings are applied in each round.
-            match scan(&tree, &boundary, &Progress::default(), &stop, folders, Some(Instant::now()), &mut counted) {
+            // A deadline in the past pauses after the first listings are recorded in each round.
+            match scan(&store, &boundary, &Progress::default(), &stop, folders, Some(Instant::now())) {
                 Outcome::Complete => break,
-                Outcome::Paused(rest) => folders = rest,
+                Outcome::Paused => folders = store.pending(),
             }
             assert!(rounds < 1000, "no progress");
         }
         // Workers read ahead until the queue closes, but a round still gets at most two
         // levels deeper, and the fixture is five levels deep.
         assert!(rounds >= 3, "the scan should have been paused several times, took {rounds}");
-        let resumed = tree.into_inner();
-        assert_eq!(listing(&resumed), listing(&whole));
-        assert_eq!(resumed.size(ROOT), whole.size(ROOT));
+        assert!(store.pending().is_empty());
+        assert_eq!(listing(&store), listing(&whole));
+        assert_eq!(store.size(ROOT), whole.size(ROOT));
     }
 
     #[test]
     fn folders_removed_while_paused_are_skipped() {
         let tmp = fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let tree = RwLock::new(Tree::new(root.clone(), "root", 0));
+        let store = new_store(&root);
         let boundary = Boundary::new(&root);
         let stop = AtomicBool::new(false);
-        let mut counted = CountedLinks::new();
-        let Outcome::Paused(pending) =
-            scan(&tree, &boundary, &Progress::default(), &stop, vec![ROOT], Some(Instant::now()), &mut counted)
-        else {
-            panic!("expected a pause");
-        };
-        let gone = pending[0];
-        tree.write().remove(gone);
-        let mut folders = pending;
-        while let Outcome::Paused(rest) = scan(&tree, &boundary, &Progress::default(), &stop, folders, None, &mut counted) {
-            folders = rest;
-        }
-        assert!(!tree.read().is_attached(gone));
+        let outcome = scan(&store, &boundary, &Progress::default(), &stop, vec![0], Some(Instant::now()));
+        assert_eq!(outcome, Outcome::Paused);
+        let gone = store.pending()[0];
+        let gone_path = store.dir_path(gone);
+        store.remove(store.item_of(gone)).unwrap();
+        while scan(&store, &boundary, &Progress::default(), &stop, store.pending(), None) == Outcome::Paused {}
+        assert!(!store.is_attached(store.item_of(gone)));
+        assert!(store.find(&gone_path).is_none());
+        assert_eq!(store.children(store.item_of(gone)).count(), 0, "a removed folder is never read");
     }
 
     #[test]

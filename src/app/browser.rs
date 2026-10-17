@@ -10,12 +10,12 @@ use dioxus::prelude::*;
 use super::icons::{Icon, Symbol};
 use super::remove::BottomBar;
 use super::state::{
-    AppState, Busy, Mode, Overview, home_dir, is_protected, use_app_state, use_list_trigger,
+    AppState, Busy, Mode, Overview, home_dir, is_protected, run_list_work, use_app_state, use_list_trigger,
 };
 use super::sunburst::Sunburst;
 use super::{SessionRef, format, icon_url, type_icon_url};
 use crate::ops;
-use crate::tree::{NodeId, ROOT, Tree, flags};
+use crate::store::{NodeId, ROOT, Store, flags};
 
 /// Rows shown per folder before the rest is folded into one "smaller items" row.
 const ROW_LIMIT: usize = 200;
@@ -37,11 +37,11 @@ struct Row {
     icon: String,
 }
 
-fn row(tree: &Tree, id: NodeId, detail: Option<String>) -> Row {
+fn row(tree: &Store, id: NodeId, detail: Option<String>) -> Row {
     let n = tree.node(id);
     let path = tree.path(id);
     // Plain files share their type's icon; drawing one per file made large folders slow.
-    let icon = if n.kind() == crate::tree::Kind::File {
+    let icon = if n.kind() == crate::store::Kind::File {
         type_icon_url(&path)
     } else {
         icon_url(&path)
@@ -51,7 +51,7 @@ fn row(tree: &Tree, id: NodeId, detail: Option<String>) -> Row {
         name: tree.display_name(id).into_owned(),
         size: n.size,
         is_dir: n.is_dir(),
-        has_children: n.first_child != crate::tree::NONE,
+        has_children: tree.has_children(id),
         hidden: n.has(flags::HIDDEN),
         path,
         detail,
@@ -70,13 +70,13 @@ fn size_class(size: u64) -> &'static str {
 }
 
 /// Selection without entries that were removed or no longer form a path below `root`.
-fn valid_selection(tree: &Tree, root: NodeId, selection: &[NodeId]) -> Vec<NodeId> {
+fn valid_selection(tree: &Store, root: NodeId, selection: &[NodeId]) -> Vec<NodeId> {
     let mut parent = root;
     selection
         .iter()
         .copied()
         .take_while(|&id| {
-            let ok = tree.is_attached(id) && tree.node(id).parent == parent;
+            let ok = tree.is_attached(id) && tree.parent(id) == parent;
             parent = id;
             ok
         })
@@ -84,7 +84,7 @@ fn valid_selection(tree: &Tree, root: NodeId, selection: &[NodeId]) -> Vec<NodeI
 }
 
 /// The folder at the center of the chart: the deepest selected folder.
-fn current_folder(tree: &Tree, root: NodeId, selection: &[NodeId]) -> NodeId {
+fn current_folder(tree: &Store, root: NodeId, selection: &[NodeId]) -> NodeId {
     selection
         .iter()
         .rev()
@@ -94,7 +94,7 @@ fn current_folder(tree: &Tree, root: NodeId, selection: &[NodeId]) -> NodeId {
 }
 
 /// Path from `root` (exclusive) to `id`, for selecting an item found in a list.
-fn selection_to(tree: &Tree, root: NodeId, id: NodeId) -> Vec<NodeId> {
+fn selection_to(tree: &Store, root: NodeId, id: NodeId) -> Vec<NodeId> {
     let chain = tree.ancestry(id);
     let start = chain.iter().position(|&a| a == root).map_or(chain.len(), |p| p + 1);
     chain[start..].to_vec()
@@ -106,7 +106,7 @@ pub fn Browser(session: SessionRef, root: NodeId) -> Element {
     let _ = (state.rev)();
     let fda = use_hook(ops::has_full_disk_access);
     let view = state.view.read().clone();
-    let tree = session.tree.read();
+    let tree = session.store();
     if !tree.is_attached(root) {
         return rsx! {};
     }
@@ -128,8 +128,18 @@ pub fn Browser(session: SessionRef, root: NodeId) -> Element {
         None
     };
 
+    let unsaved = session.store().write_error();
+
     rsx! {
         div { class: "browser",
+            if let Some(reason) = unsaved {
+                div { class: "banner",
+                    Symbol { icon: Icon::Lock }
+                    span { class: "banner-text",
+                        "This scan cannot be saved ({reason}). Its results are kept until What Disk quits."
+                    }
+                }
+            }
             if needs_fda {
                 div { class: "banner",
                     Symbol { icon: Icon::Lock }
@@ -173,7 +183,7 @@ fn Columns(session: SessionRef, root: NodeId, selection: Vec<NodeId>) -> Element
     let mut state = use_app_state();
     let _ = (state.rev)();
     let view = state.view.read().clone();
-    let tree = session.tree.read();
+    let tree = session.store();
     let complete = session.is_complete();
     let unaccounted = (root == ROOT && complete)
         .then(|| state.volume_of(&session.root))
@@ -275,7 +285,7 @@ fn Columns(session: SessionRef, root: NodeId, selection: Vec<NodeId>) -> Element
 }
 
 fn handle_key(mut state: AppState, session: &SessionRef, root: NodeId, e: KeyboardEvent) {
-    let tree = session.tree.read();
+    let tree = session.store();
     let selection = valid_selection(&tree, root, &state.view.peek().selection);
     let parent = selection.len().checked_sub(2).map_or(root, |i| selection[i]);
     let mut next = selection.clone();
@@ -401,8 +411,13 @@ fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
         let kind = job_kind.clone();
         async move {
             computing.set(true);
-            let found = tokio::task::spawn_blocking(move || {
-                let tree = session.tree.read();
+            // Searching reads the whole scan from disk. Each keystroke replaces this list, and
+            // a replaced list is dropped during this pause, before it starts reading.
+            if matches!(kind, ListKind::Search(_)) {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let found = run_list_work(move || {
+                let tree = session.store();
                 match kind {
                     ListKind::Biggest => tree.biggest(root, LIST_LIMIT),
                     ListKind::Search(q) => tree.search(root, &q, LIST_LIMIT),
@@ -417,7 +432,7 @@ fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
 
     let _ = (state.rev)();
     let view = state.view.read().clone();
-    let tree = session.tree.read();
+    let tree = session.store();
     let selected = view.selection.last().copied();
     let rows: Vec<Row> = ids
         .read()
@@ -425,7 +440,7 @@ fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
         .copied()
         .filter(|&id| tree.is_attached(id))
         .map(|id| {
-            let parent = tree.node(id).parent;
+            let parent = tree.parent(id);
             let rel = tree.path(parent);
             let base = tree.path(root);
             let detail = rel
@@ -450,7 +465,7 @@ fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
                     onselect: {
                         let session = session.clone();
                         move |id| {
-                            let sel = selection_to(&session.tree.read(), root, id);
+                            let sel = selection_to(&session.store(), root, id);
                             state.view.with_mut(|v| v.selection = sel);
                         }
                     },
@@ -473,7 +488,7 @@ fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
 fn PathBar(session: SessionRef, root: NodeId, root_name: String, selection: Vec<NodeId>) -> Element {
     let mut state = use_app_state();
     let _ = (state.rev)();
-    let tree = session.tree.read();
+    let tree = session.store();
     let mut crumbs = vec![(0usize, root_name, tree.path(root))];
     for (i, &id) in selection.iter().enumerate() {
         crumbs.push((i + 1, tree.display_name(id).into_owned(), tree.path(id)));
@@ -504,7 +519,7 @@ fn target_of(state: &AppState, path: &Path) -> Option<(Arc<super::Session>, Node
         return state.resolve(path);
     }
     let (session, _) = state.resolve(&state.selected.peek().clone())?;
-    let id = session.tree.read().find(path)?;
+    let id = session.store().find(path)?;
     Some((session, id))
 }
 
@@ -538,7 +553,7 @@ pub fn show_context_menu(mut state: AppState, path: PathBuf) {
     let Some((session, id)) = target_of(&state, &path) else {
         return;
     };
-    let tree = session.tree.read();
+    let tree = session.store();
     let is_dir = tree.node(id).is_dir();
     let protected = is_protected(&tree, id);
     drop(tree);
@@ -674,7 +689,7 @@ fn refresh_trash(state: AppState) {
     let trash = home_dir().join(".Trash");
     let sessions: Vec<Arc<super::Session>> = state.sessions.peek().values().cloned().collect();
     for session in sessions {
-        let id = session.tree.read().find(&trash);
+        let id = session.store().find(&trash);
         if let Some(id) = id {
             state.rescan_folder(session, id);
         }
@@ -684,27 +699,32 @@ fn refresh_trash(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Kind;
+    use crate::store::Kind;
+    use crate::store::testing::Builder;
 
     #[test]
     fn selection_is_cut_at_the_first_removed_item() {
         // After a deletion or rescan the columns must not point at items that are gone.
-        let mut t = Tree::new("/r".into(), "r", 0);
-        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
-        let b = t.add(a, b"b", Kind::Dir, 0, 0, 0);
-        let c = t.add(b, b"c", Kind::File, 0, 1, 0);
-        assert_eq!(valid_selection(&t, ROOT, &[a, b, c]), vec![a, b, c]);
-        t.remove(b);
-        assert_eq!(valid_selection(&t, ROOT, &[a, b, c]), vec![a]);
+        let mut b = Builder::new("/r", "r");
+        let a = b.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
+        let bb = b.add(a, b"b", Kind::Dir, 0, 0, 0);
+        let c = b.add(bb, b"c", Kind::File, 0, 1, 0);
+        let t = b.build();
+        let (a, bb, c) = (t.id(a), t.id(bb), t.id(c));
+        assert_eq!(valid_selection(&t, ROOT, &[a, bb, c]), vec![a, bb, c]);
+        t.remove(bb).unwrap();
+        assert_eq!(valid_selection(&t, ROOT, &[a, bb, c]), vec![a]);
         // A selection that does not start below the view root is dropped entirely.
         assert!(valid_selection(&t, a, &[c]).is_empty());
     }
 
     #[test]
     fn chart_centers_on_the_deepest_selected_folder() {
-        let mut t = Tree::new("/r".into(), "r", 0);
-        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
-        let f = t.add(a, b"f", Kind::File, 0, 1, 0);
+        let mut b = Builder::new("/r", "r");
+        let a = b.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
+        let f = b.add(a, b"f", Kind::File, 0, 1, 0);
+        let t = b.build();
+        let (a, f) = (t.id(a), t.id(f));
         assert_eq!(current_folder(&t, ROOT, &[]), ROOT);
         assert_eq!(current_folder(&t, ROOT, &[a]), a);
         assert_eq!(current_folder(&t, ROOT, &[a, f]), a);

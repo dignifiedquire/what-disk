@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::locations::{Locations, Root};
-use crate::tree::{NodeId, ROOT, Tree, flags};
+use crate::store::{NodeId, ROOT, Store, flags};
 use Language::{Ai, C, Go, Java, JavaScript as Js, Python, Ruby, Rust, Swift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -187,7 +187,7 @@ const SYSTEM_FOLDERS: &[&str] = &[
 /// project has `vendor/bundle/` or `tmp/cache/` next to its `Gemfile`. Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
-pub fn find_projects(tree: &Tree) -> Vec<Project> {
+pub fn find_projects(tree: &Store) -> Vec<Project> {
     let skip = skipped_folders(tree);
     let mut out = Vec::new();
     let mut stack = vec![ROOT];
@@ -201,9 +201,10 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         let (mut pyvenv_cfg, mut tox_config, mut noxfile) = (false, false, false);
         let (mut tox, mut nox, mut mypy, mut ruff, mut pytest) = (None, None, None, None, None);
         let (mut gemfile, mut vendor, mut tmp) = (false, None, None);
-        for c in tree.children(dir) {
-            let is_dir = tree.node(c).is_dir();
-            match tree.name(c).as_bytes() {
+        let entries = tree.entries(dir);
+        for (c, node, name) in &entries {
+            let (c, is_dir) = (*c, node.is_dir());
+            match name.as_bytes() {
                 b"Cargo.toml" if !is_dir => cargo_toml = true,
                 b"package.json" if !is_dir => package_json = true,
                 b"pom.xml" if !is_dir => pom_xml = true,
@@ -248,8 +249,7 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         if let Some(kind) = build_kind
             && dir != ROOT
         {
-            let parent = tree.node(dir).parent;
-            out.push(Project { dir: parent, artifacts: vec![Artifact { id: dir, kind }] });
+            out.push(Project { dir: tree.parent(dir), artifacts: vec![Artifact { id: dir, kind }] });
             continue;
         }
         let mut artifacts = Vec::new();
@@ -274,14 +274,13 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         found(ruff, ArtifactKind::RuffCache, tagged(ruff));
         found(pytest, ArtifactKind::PytestCache, tagged(pytest));
         let child_dir = |parent: Option<NodeId>, name: &[u8]| {
-            parent.and_then(|p| tree.children(p).find(|&c| tree.node(c).is_dir() && tree.name(c).as_bytes() == name))
+            parent.and_then(|p| tree.entries(p).into_iter().find(|(_, n, c)| n.is_dir() && c.as_bytes() == name).map(|e| e.0))
         };
         // vendor/cache is meant to be committed, and the rest of tmp/ holds secrets and pids.
         found(child_dir(vendor, b"bundle"), ArtifactKind::VendorBundle, gemfile);
         found(child_dir(tmp, b"cache"), ArtifactKind::RailsCache, gemfile);
         // Hidden folders are not searched, so a `.venv` is recognised from here.
-        for c in tree.children(dir) {
-            let n = tree.node(c);
+        for &(c, n, _) in &entries {
             if n.is_dir()
                 && n.has(flags::HIDDEN)
                 && !artifacts.iter().any(|a| a.id == c)
@@ -290,8 +289,7 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
                 artifacts.push(Artifact { id: c, kind: ArtifactKind::PythonVenv });
             }
         }
-        for c in tree.children(dir) {
-            let n = tree.node(c);
+        for &(c, n, _) in &entries {
             let searchable = n.is_dir()
                 && !n.has(flags::PACKAGE | flags::HIDDEN)
                 && Some(c) != node_modules
@@ -308,12 +306,12 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
     out
 }
 
-fn has_child(tree: &Tree, dir: NodeId, name: &[u8]) -> bool {
-    tree.children(dir).any(|c| tree.name(c).as_bytes() == name)
+fn has_child(tree: &Store, dir: NodeId, name: &[u8]) -> bool {
+    tree.entries(dir).iter().any(|(_, _, n)| n.as_bytes() == name)
 }
 
 /// System folders and every user's `Library` that occur in this tree.
-fn skipped_folders(tree: &Tree) -> HashSet<NodeId> {
+fn skipped_folders(tree: &Store) -> HashSet<NodeId> {
     let mut skip: HashSet<NodeId> = SYSTEM_FOLDERS
         .iter()
         .filter_map(|p| tree.find(Path::new(p)))
@@ -512,7 +510,7 @@ fn without_xcode_suffix(name: &str) -> &str {
 
 /// Global caches and installed toolchain versions, wherever `locations` says they are, if
 /// this tree contains them.
-pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache> {
+pub fn find_global_caches(tree: &Store, locations: &Locations) -> Vec<GlobalCache> {
     let mut out: Vec<GlobalCache> = Vec::new();
     let mut add = |cache: GlobalCache| {
         if !out.iter().any(|c| c.id == cache.id) {
@@ -571,33 +569,33 @@ pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache
 }
 
 /// Newest modification time in the subtree of `id`: when it was last built or installed.
-pub fn newest_mtime(tree: &Tree, id: NodeId) -> u32 {
+pub fn newest_mtime(tree: &Store, id: NodeId) -> u32 {
     let mut newest = tree.node(id).mtime;
-    let mut stack = vec![id];
-    while let Some(n) = stack.pop() {
-        for c in tree.children(n) {
-            newest = newest.max(tree.node(c).mtime);
-            stack.push(c);
-        }
-    }
+    // Walks only this folder's subtree; `visit_all` would check every folder of the scan,
+    // once for each of hundreds of build folders.
+    tree.walk(id, |_, node, _| {
+        newest = newest.max(node.mtime);
+        true
+    });
     newest
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Kind;
+    use crate::store::Kind;
+    use crate::store::testing::Builder;
     use std::path::PathBuf;
 
-    fn dir(t: &mut Tree, parent: NodeId, name: &str) -> NodeId {
+    fn dir(t: &mut Builder, parent: NodeId, name: &str) -> NodeId {
         t.add(parent, name.as_bytes(), Kind::Dir, 0, 0, 0)
     }
 
-    fn file(t: &mut Tree, parent: NodeId, name: &str, size: u64, mtime: u32) -> NodeId {
+    fn file(t: &mut Builder, parent: NodeId, name: &str, size: u64, mtime: u32) -> NodeId {
         t.add(parent, name.as_bytes(), Kind::File, 0, size, mtime)
     }
 
-    fn found(t: &Tree) -> Vec<(PathBuf, Vec<ArtifactKind>)> {
+    fn found(t: &Store) -> Vec<(PathBuf, Vec<ArtifactKind>)> {
         let mut v: Vec<_> = find_projects(t)
             .into_iter()
             .map(|p| (t.path(p.dir), p.artifacts.iter().map(|a| a.kind).collect()))
@@ -608,7 +606,7 @@ mod tests {
 
     #[test]
     fn rust_and_js_projects_are_found_by_their_build_folders() {
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let rs = dir(&mut t, ROOT, "rs");
         file(&mut t, rs, "Cargo.toml", 1, 0);
         let target = dir(&mut t, rs, "target");
@@ -617,7 +615,7 @@ mod tests {
         file(&mut t, web, "package.json", 1, 0);
         dir(&mut t, web, "node_modules");
         assert_eq!(
-            found(&t),
+            found(&t.build()),
             vec![
                 ("/w/rs".into(), vec![ArtifactKind::CargoTarget]),
                 ("/w/web".into(), vec![ArtifactKind::NodeModules]),
@@ -629,29 +627,29 @@ mod tests {
     fn a_folder_is_only_a_build_folder_next_to_its_manifest() {
         // "target" and "node_modules" are ordinary names elsewhere; deleting those would
         // destroy user data, so they must not be offered.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let photos = dir(&mut t, ROOT, "photos");
         dir(&mut t, photos, "target");
         let stray = dir(&mut t, ROOT, "stray");
         dir(&mut t, stray, "node_modules");
-        assert!(found(&t).is_empty());
+        assert!(found(&t.build()).is_empty());
     }
 
     #[test]
     fn a_cargo_tagged_target_counts_without_a_manifest_next_to_it() {
         // A shared CARGO_TARGET_DIR has no Cargo.toml beside it but is still Cargo's.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let shared = dir(&mut t, ROOT, "builds");
         let target = dir(&mut t, shared, "target");
         file(&mut t, target, "CACHEDIR.TAG", 1, 0);
-        assert_eq!(found(&t), vec![("/w/builds".into(), vec![ArtifactKind::CargoTarget])]);
+        assert_eq!(found(&t.build()), vec![("/w/builds".into(), vec![ArtifactKind::CargoTarget])]);
     }
 
     #[test]
     fn workspaces_and_nested_dependencies_are_not_listed_twice() {
         // Workspace members share the root's target; packages inside node_modules have
         // their own package.json and node_modules but belong to the outer project.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let ws = dir(&mut t, ROOT, "ws");
         file(&mut t, ws, "Cargo.toml", 1, 0);
         dir(&mut t, ws, "target");
@@ -663,7 +661,7 @@ mod tests {
         file(&mut t, pkg, "package.json", 1, 0);
         dir(&mut t, pkg, "node_modules");
         assert_eq!(
-            found(&t),
+            found(&t.build()),
             vec![("/w/ws".into(), vec![ArtifactKind::CargoTarget, ArtifactKind::NodeModules])]
         );
     }
@@ -672,7 +670,7 @@ mod tests {
     fn installed_software_is_not_offered_for_cleaning() {
         // Electron apps, editor extensions and global npm tools ship node_modules next to a
         // package.json; deleting them breaks the software.
-        let mut t = Tree::new("/".into(), "Macintosh HD", 0);
+        let mut t = Builder::new("/", "Macintosh HD");
         let apps = dir(&mut t, ROOT, "Applications");
         let app = t.add(apps, b"Slack.app", Kind::Dir, flags::PACKAGE, 0, 0);
         file(&mut t, app, "package.json", 1, 0);
@@ -691,14 +689,14 @@ mod tests {
         let code = dir(&mut t, me, "code");
         file(&mut t, code, "package.json", 1, 0);
         dir(&mut t, code, "node_modules");
-        assert_eq!(found(&t), vec![("/Users/me/code".into(), vec![ArtifactKind::NodeModules])]);
+        assert_eq!(found(&t.build()), vec![("/Users/me/code".into(), vec![ArtifactKind::NodeModules])]);
     }
 
     #[test]
     fn global_caches_and_each_toolchain_version_are_listed() {
         // Compiler caches and old toolchain versions are where Rust and Node.js space hides
         // outside projects; each version is its own entry so old ones can be removed alone.
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let cargo = t.add(ROOT, b".cargo", Kind::Dir, flags::HIDDEN, 0, 0);
         let registry = dir(&mut t, cargo, "registry");
         let rustup = t.add(ROOT, b".rustup", Kind::Dir, flags::HIDDEN, 0, 0);
@@ -718,13 +716,14 @@ mod tests {
         let v23 = dir(&mut t, node, "v23.3.0");
         let npm = t.add(ROOT, b".npm", Kind::Dir, flags::HIDDEN, 0, 0);
 
-        let caches = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
-        let mut ids: Vec<NodeId> = caches.iter().map(|c| c.id).collect();
+        let s = t.build();
+        let caches = find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")));
+        let mut ids: Vec<NodeId> = caches.iter().map(|c| s.added(c.id)).collect();
         ids.sort();
         let mut expected = vec![registry, stable, nightly, kache, deno, v23, npm];
         expected.sort();
         assert_eq!(ids, expected);
-        let label = |id| caches.iter().find(|c| c.id == id).map(|c| (c.label.as_str(), c.language));
+        let label = |id| caches.iter().find(|c| s.added(c.id) == id).map(|c| (c.label.as_str(), c.language));
         assert_eq!(label(kache), Some(("kache", Language::Rust)));
         assert_eq!(label(v23), Some(("Node.js v23.3.0", Language::JavaScript)));
         assert_eq!(label(nightly), Some(("rustup toolchain nightly-2024-01-01-aarch64-apple-darwin", Language::Rust)));
@@ -732,7 +731,7 @@ mod tests {
 
     #[test]
     fn go_caches_and_sdks_are_listed() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let go = dir(&mut t, ROOT, "go");
         let pkg = dir(&mut t, go, "pkg");
         let modcache = dir(&mut t, pkg, "mod");
@@ -744,11 +743,12 @@ mod tests {
         // Another tool's SDK in the same folder must not be listed as Go.
         dir(&mut t, sdk, "flutter");
 
-        let caches = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
+        let s = t.build();
+        let caches = find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")));
         let go_caches: Vec<(NodeId, &str)> = caches
             .iter()
             .filter(|c| c.language == Language::Go)
-            .map(|c| (c.id, c.label.as_str()))
+            .map(|c| (s.added(c.id), c.label.as_str()))
             .collect();
         assert_eq!(
             go_caches,
@@ -761,7 +761,7 @@ mod tests {
     fn java_build_folders_need_their_build_file_next_to_them() {
         // "target" and "build" are common names; only Maven's and Gradle's own are offered,
         // and a Rust target is never mistaken for Maven's.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let maven = dir(&mut t, ROOT, "maven");
         file(&mut t, maven, "pom.xml", 1, 0);
         dir(&mut t, maven, "target");
@@ -782,7 +782,7 @@ mod tests {
         file(&mut t, both, "pom.xml", 1, 0);
         dir(&mut t, both, "target");
         assert_eq!(
-            found(&t),
+            found(&t.build()),
             vec![
                 ("/w/both".into(), vec![ArtifactKind::CargoTarget]),
                 ("/w/gradle".into(), vec![ArtifactKind::GradleBuild, ArtifactKind::GradleProjectCache]),
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn java_caches_and_each_jdk_and_gradle_version_are_listed() {
-        let mut t = Tree::new("/".into(), "Macintosh HD", 0);
+        let mut t = Builder::new("/", "Macintosh HD");
         let library = dir(&mut t, ROOT, "Library");
         let java = dir(&mut t, library, "Java");
         let jvms = dir(&mut t, java, "JavaVirtualMachines");
@@ -810,11 +810,12 @@ mod tests {
         let dists = dir(&mut t, wrapper, "dists");
         let g85 = dir(&mut t, dists, "gradle-8.5-bin");
 
-        let found = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
+        let s = t.build();
+        let found = find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")));
         let mut java: Vec<(NodeId, String)> = found
             .iter()
             .filter(|c| c.language == Language::Java)
-            .map(|c| (c.id, c.label.clone()))
+            .map(|c| (s.added(c.id), c.label.clone()))
             .collect();
         java.sort();
         let mut expected = vec![
@@ -831,7 +832,7 @@ mod tests {
     fn c_build_folders_are_found_by_their_contents_but_never_the_sources() {
         // CMake and Meson build folders can have any name. An in-source build puts the cache
         // next to the sources; that folder must not be offered, or the code would be deleted.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let lib = dir(&mut t, ROOT, "lib");
         file(&mut t, lib, "CMakeLists.txt", 1, 0);
         let debug = dir(&mut t, lib, "cmake-build-debug");
@@ -851,11 +852,12 @@ mod tests {
         let sub_build = dir(&mut t, sub, "build");
         file(&mut t, sub_build, "CMakeCache.txt", 1, 0);
 
-        let projects = find_projects(&t);
+        let s = t.build();
+        let projects = find_projects(&s);
         let mut builds: Vec<(PathBuf, PathBuf, ArtifactKind)> = projects
             .iter()
             .flat_map(|p| p.artifacts.iter().map(move |a| (p.dir, *a)))
-            .map(|(d, a)| (t.path(d), t.path(a.id), a.kind))
+            .map(|(d, a)| (s.path(d), s.path(a.id), a.kind))
             .collect();
         builds.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
@@ -870,36 +872,37 @@ mod tests {
 
     #[test]
     fn c_caches_are_listed() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let library = dir(&mut t, ROOT, "Library");
         let caches = dir(&mut t, library, "Caches");
         let ccache = dir(&mut t, caches, "ccache");
         let conan = t.add(ROOT, b".conan2", Kind::Dir, flags::HIDDEN, 0, 0);
         let packages = dir(&mut t, conan, "p");
-        let found: Vec<(NodeId, String)> = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+        let s = t.build();
+        let found: Vec<(NodeId, String)> = find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")))
             .into_iter()
             .filter(|c| c.language == Language::C)
-            .map(|c| (c.id, c.label))
+            .map(|c| (s.added(c.id), c.label))
             .collect();
         assert_eq!(found, vec![(ccache, "ccache".into()), (packages, "Conan packages".into())]);
     }
 
     #[test]
     fn swift_packages_are_found_by_their_build_folder() {
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let pkg = dir(&mut t, ROOT, "pkg");
         file(&mut t, pkg, "Package.swift", 1, 0);
         t.add(pkg, b".build", Kind::Dir, flags::HIDDEN, 0, 0);
         let other = dir(&mut t, ROOT, "other");
         t.add(other, b".build", Kind::Dir, flags::HIDDEN, 0, 0);
-        assert_eq!(found(&t), vec![("/w/pkg".into(), vec![ArtifactKind::SwiftPmBuild])]);
+        assert_eq!(found(&t.build()), vec![("/w/pkg".into(), vec![ArtifactKind::SwiftPmBuild])]);
     }
 
     #[test]
     fn xcode_data_is_listed_per_project_and_device_version() {
         // DerivedData and device support grow one folder per project or OS version; each is
         // its own entry, named without Xcode's random suffix.
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let library = dir(&mut t, ROOT, "Library");
         let developer = dir(&mut t, library, "Developer");
         let xcode = dir(&mut t, developer, "Xcode");
@@ -907,10 +910,11 @@ mod tests {
         let app = dir(&mut t, derived, "deltachat-ios-dgddllzyrnuofhchphksaujitkre");
         let support = dir(&mut t, xcode, "iOS DeviceSupport");
         let ios = dir(&mut t, support, "17.1 (21B80)");
-        let labels: Vec<(NodeId, String)> = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+        let s = t.build();
+        let labels: Vec<(NodeId, String)> = find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")))
             .into_iter()
             .filter(|c| c.language == Language::Swift)
-            .map(|c| (c.id, c.label))
+            .map(|c| (s.added(c.id), c.label))
             .collect();
         assert_eq!(
             labels,
@@ -933,7 +937,7 @@ mod tests {
     fn python_environments_are_recognised_by_their_pyvenv_cfg() {
         // "env" and "venv" are common names for unrelated folders; only a real virtual
         // environment may be offered, and a Pipenv `.venv` pointer file is not a folder.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let app = dir(&mut t, ROOT, "app");
         file(&mut t, app, "pyproject.toml", 1, 0);
         let venv = t.add(app, b".venv", Kind::Dir, flags::HIDDEN, 0, 0);
@@ -955,9 +959,10 @@ mod tests {
         file(&mut t, nox, "noxfile.py", 1, 0);
         t.add(nox, b".nox", Kind::Dir, flags::HIDDEN, 0, 0);
 
-        let mut kinds: Vec<(PathBuf, ArtifactKind)> = find_projects(&t)
+        let s = t.build();
+        let mut kinds: Vec<(PathBuf, ArtifactKind)> = find_projects(&s)
             .into_iter()
-            .flat_map(|p| p.artifacts.into_iter().map(|a| (t.path(a.id), a.kind)).collect::<Vec<_>>())
+            .flat_map(|p| p.artifacts.into_iter().map(|a| (s.path(a.id), a.kind)).collect::<Vec<_>>())
             .collect();
         kinds.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
@@ -974,7 +979,7 @@ mod tests {
 
     #[test]
     fn python_caches_interpreters_and_environments_are_listed() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let library = dir(&mut t, ROOT, "Library");
         let caches = dir(&mut t, library, "Caches");
         let pip = dir(&mut t, caches, "pip");
@@ -994,11 +999,12 @@ mod tests {
         let versions = dir(&mut t, pyenv, "versions");
         let v311 = dir(&mut t, versions, "3.11.9");
 
+        let s = t.build();
         let mut found: Vec<(NodeId, String)> =
-            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+            find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")))
                 .into_iter()
                 .filter(|c| c.language == Language::Python)
-                .map(|c| (c.id, c.label))
+                .map(|c| (s.added(c.id), c.label))
                 .collect();
         found.sort();
         let mut expected = vec![
@@ -1017,7 +1023,7 @@ mod tests {
     fn ruby_folders_need_a_gemfile_and_only_the_regenerable_parts_count() {
         // vendor/cache is committed on purpose, and tmp/ also holds the development secret,
         // so only vendor/bundle and tmp/cache are offered.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let app = dir(&mut t, ROOT, "app");
         file(&mut t, app, "Gemfile", 1, 0);
         let vendor = dir(&mut t, app, "vendor");
@@ -1029,9 +1035,10 @@ mod tests {
         let other = dir(&mut t, ROOT, "other");
         let other_vendor = dir(&mut t, other, "vendor");
         dir(&mut t, other_vendor, "bundle");
-        let mut paths: Vec<(PathBuf, ArtifactKind)> = find_projects(&t)
+        let s = t.build();
+        let mut paths: Vec<(PathBuf, ArtifactKind)> = find_projects(&s)
             .into_iter()
-            .flat_map(|p| p.artifacts.into_iter().map(|a| (t.path(a.id), a.kind)).collect::<Vec<_>>())
+            .flat_map(|p| p.artifacts.into_iter().map(|a| (s.path(a.id), a.kind)).collect::<Vec<_>>())
             .collect();
         paths.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
@@ -1045,7 +1052,7 @@ mod tests {
 
     #[test]
     fn ruby_versions_and_version_manager_installs_are_listed_by_language() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let rbenv = t.add(ROOT, b".rbenv", Kind::Dir, flags::HIDDEN, 0, 0);
         let versions = dir(&mut t, rbenv, "versions");
         let ruby33 = dir(&mut t, versions, "3.3.0");
@@ -1062,10 +1069,11 @@ mod tests {
         let erlang = dir(&mut t, installs, "erlang");
         dir(&mut t, erlang, "27.0");
 
+        let s = t.build();
         let found: Vec<(NodeId, Language, String)> =
-            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+            find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")))
                 .into_iter()
-                .map(|c| (c.id, c.language, c.label))
+                .map(|c| (s.added(c.id), c.language, c.label))
                 .collect();
         assert!(found.contains(&(ruby33, Language::Ruby, "Ruby (rbenv) 3.3.0".into())));
         assert!(found.contains(&(ruby_src, Language::Ruby, "ruby-install sources ruby-3.3.0".into())));
@@ -1076,7 +1084,7 @@ mod tests {
 
     #[test]
     fn ai_tool_data_is_listed_and_hugging_face_models_one_by_one() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let claude = t.add(ROOT, b".claude", Kind::Dir, flags::HIDDEN, 0, 0);
         let transcripts = dir(&mut t, claude, "projects");
         dir(&mut t, claude, "settings-are-not-listed");
@@ -1089,11 +1097,12 @@ mod tests {
         let model = dir(&mut t, hub, "models--mlx-community--Qwen3-8B-4bit");
         let dataset = dir(&mut t, hub, "datasets--org--data");
         t.add(hub, b".locks", Kind::Dir, flags::HIDDEN, 0, 0);
+        let s = t.build();
         let mut found: Vec<(NodeId, String)> =
-            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+            find_global_caches(&s, &Locations::defaults(Path::new("/Users/me")))
                 .into_iter()
                 .filter(|c| c.language == Language::Ai)
-                .map(|c| (c.id, c.label))
+                .map(|c| (s.added(c.id), c.label))
                 .collect();
         found.sort();
         let mut expected = vec![
@@ -1109,11 +1118,12 @@ mod tests {
     #[test]
     fn age_comes_from_the_newest_file_inside() {
         // The folder's own date changes rarely; the last build touches files deep inside.
-        let mut t = Tree::new("/w".into(), "w", 0);
+        let mut t = Builder::new("/w", "w");
         let target = t.add(ROOT, b"target", Kind::Dir, 0, 0, 10);
         let debug = t.add(target, b"debug", Kind::Dir, 0, 0, 20);
         file(&mut t, debug, "old", 1, 15);
         file(&mut t, debug, "new", 1, 99);
-        assert_eq!(newest_mtime(&t, target), 99);
+        let s = t.build();
+        assert_eq!(newest_mtime(&s, s.id(target)), 99);
     }
 }

@@ -67,8 +67,14 @@ Full Disk Access in System Settings > Privacy & Security > Full Disk Access.
 
 ## Data
 
-Saved scans are kept in `~/Library/Caches/com.dignifiedquire.whatdisk`. Deleting that
-folder only means the next start shows no previous scans.
+Each scan is written to disk while it runs, in `~/Library/Caches/com.dignifiedquire.whatdisk`:
+one file per location, holding every folder's listing as it is read. Memory keeps only a
+small entry per folder (a whole startup disk with 12 million items needs about 60 MB);
+views read file and folder details back from the file. Searching or listing the biggest
+files of a whole disk therefore reads its file, which takes a second or two.
+
+Deleting that folder only means the next start shows no previous scans. Scans saved by
+earlier versions are converted the first time they are opened.
 
 ## Development
 
@@ -81,8 +87,7 @@ do not include this.
 | Module | Purpose |
 | --- | --- |
 | `src/scan.rs` | Parallel, resumable scanning with `dua-core` |
-| `src/tree.rs` | Compact tree that holds a scan |
-| `src/cache.rs` | Saving and loading scans |
+| `src/store.rs` | A scan on disk: writing listings, reading them back, saved scans |
 | `src/volumes.rs` | Volumes and which folders a scan may enter |
 | `src/dev.rs` | Finding project build folders and toolchain caches |
 | `src/apps.rs`, `src/brew.rs` | Applications, their data, and Homebrew |

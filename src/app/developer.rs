@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use dioxus::prelude::*;
 
 use super::browser::show_context_menu;
-use super::state::{AppState, Busy, Session, home_dir, use_app_state, use_list_trigger};
+use super::state::{AppState, Busy, Session, home_dir, run_list_work, use_app_state, use_list_trigger};
 use super::{format, icon_url};
 use crate::dev::{self, ArtifactKind, Language};
 use crate::locations::Locations;
@@ -45,7 +45,7 @@ pub fn collect(mut sessions: Vec<Arc<Session>>, locations: &Locations) -> Vec<De
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     for session in sessions {
-        let tree = session.tree.read();
+        let tree = session.store();
         for project in dev::find_projects(&tree) {
             let location = tree.path(project.dir);
             let title = tree.display_name(project.dir).into_owned();
@@ -121,9 +121,7 @@ fn use_rows(state: AppState) -> (Signal<Vec<DevRow>>, Signal<bool>) {
         let locations = state.tool_locations.read().clone();
         async move {
             computing.set(true);
-            let found = tokio::task::spawn_blocking(move || collect(sessions, &locations))
-                .await
-                .unwrap_or_default();
+            let found = run_list_work(move || collect(sessions, &locations)).await.unwrap_or_default();
             rows.set(found);
             computing.set(false);
         }
@@ -292,7 +290,7 @@ pub fn DevToolbar() -> Element {
         let sessions = state.sessions.read();
         let mut names: Vec<String> = sessions
             .values()
-            .map(|s| s.tree.read().display_name(crate::tree::ROOT).into_owned())
+            .map(|s| s.store().display_name(crate::store::ROOT).into_owned())
             .filter(|n| !n.is_empty())
             .collect();
         names.sort();
@@ -336,19 +334,20 @@ pub fn DevToolbar() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{Kind, ROOT, Tree};
+    use crate::store::testing::Builder;
+    use crate::store::{Kind, ROOT};
     use std::time::SystemTime;
 
-    fn session(root: &str, scanned_at: u64, build: impl FnOnce(&mut Tree)) -> Arc<Session> {
+    fn session(root: &str, scanned_at: u64, build: impl FnOnce(&mut Builder)) -> Arc<Session> {
         let s = Session::new(Path::new(root), "x");
-        let mut tree = Tree::new(root.into(), "x", 0);
+        let mut tree = Builder::new(root, "x");
         build(&mut tree);
-        *s.tree.write() = tree;
+        s.set_store(tree.build().store);
         *s.scanned_at.lock() = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(scanned_at));
         Arc::new(s)
     }
 
-    fn rust_project(t: &mut Tree, parent: crate::tree::NodeId, name: &str, size: u64) {
+    fn rust_project(t: &mut Builder, parent: crate::store::NodeId, name: &str, size: u64) {
         let p = t.add(parent, name.as_bytes(), Kind::Dir, 0, 0, 0);
         t.add(p, b"Cargo.toml", Kind::File, 0, 1, 0);
         let target = t.add(p, b"target", Kind::Dir, 0, 0, 0);

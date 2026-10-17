@@ -8,14 +8,14 @@ use dioxus::prelude::*;
 use super::browser::run_removal;
 use super::state::{AppState, Busy, Overview, effective_checked, is_protected, use_app_state};
 use super::{SessionRef, format, icon_url};
-use crate::tree::{NodeId, ROOT, Tree};
+use crate::store::{NodeId, ROOT, Store};
 
 #[component]
 pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
     let mut state = use_app_state();
     let _ = (state.rev)();
     let busy = session.busy();
-    let tree = session.tree.read();
+    let tree = session.store();
     let checked = effective_checked(&tree, &state.view.read().checked);
     let checked_size: u64 = checked.iter().map(|&id| tree.size(id)).sum();
     let scanned = tree.size(ROOT);
@@ -95,21 +95,21 @@ enum Phase {
 /// What the sheet would remove, as (name, path, size): the checked folders of the Developer
 /// view, or the checked items of the scan on screen.
 fn pending_items(state: AppState) -> Vec<(String, PathBuf, u64)> {
-    let describe = |tree: &Tree, id: NodeId| (tree.display_name(id).into_owned(), tree.path(id), tree.size(id));
+    let describe = |tree: &Store, id: NodeId| (tree.display_name(id).into_owned(), tree.path(id), tree.size(id));
     if (state.overview)() == Some(Overview::Projects) {
         return state
             .dev_checked
             .read()
             .iter()
             .filter_map(|p| state.resolve(p))
-            .filter(|(s, id)| !is_protected(&s.tree.read(), *id))
-            .map(|(s, id)| describe(&s.tree.read(), id))
+            .filter(|(s, id)| !is_protected(&s.store(), *id))
+            .map(|(s, id)| describe(&s.store(), id))
             .collect();
     }
     let Some((session, _)) = state.resolve(&state.selected.peek().clone()) else {
         return Vec::new();
     };
-    let tree = session.tree.read();
+    let tree = session.store();
     effective_checked(&tree, &state.view.read().checked)
         .into_iter()
         .filter(|&id| !is_protected(&tree, id))

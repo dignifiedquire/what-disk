@@ -6,7 +6,7 @@ use std::path::Path;
 
 use objc2_foundation::{NSBundle, NSString};
 
-use crate::tree::{NodeId, Tree, flags};
+use crate::store::{NodeId, Store, flags};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleInfo {
@@ -38,20 +38,19 @@ pub fn bundle_info(path: &Path) -> BundleInfo {
 }
 
 /// `.app` bundles in `folder` and its subfolders, but not apps inside other bundles.
-pub fn find_apps(tree: &Tree, folder: &Path) -> Vec<NodeId> {
+pub fn find_apps(tree: &Store, folder: &Path) -> Vec<NodeId> {
     let Some(start) = tree.find(folder) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut stack = vec![start];
     while let Some(dir) = stack.pop() {
-        for c in tree.children(dir) {
-            let n = tree.node(c);
+        for (c, n, name) in tree.entries(dir) {
             if !n.is_dir() {
                 continue;
             }
             if n.has(flags::PACKAGE) {
-                if tree.name(c).as_bytes().ends_with(b".app") {
+                if name.as_bytes().ends_with(b".app") {
                     out.push(c);
                 }
             } else {
@@ -100,7 +99,7 @@ pub struct DataFolder {
 /// Items in `library` (a user's `~/Library`) that belong to the app with bundle identifier
 /// `bundle_id` and name `name`. Names must match exactly (ignoring case), since uninstalling
 /// removes everything listed here; very short names are not matched to avoid collisions.
-pub fn data_folders(tree: &Tree, library: &Path, bundle_id: &str, name: &str) -> Vec<DataFolder> {
+pub fn data_folders(tree: &Store, library: &Path, bundle_id: &str, name: &str) -> Vec<DataFolder> {
     let id = bundle_id.to_ascii_lowercase();
     let name = name.to_ascii_lowercase();
     let matches = |item: &str, rule: Match| match rule {
@@ -116,8 +115,8 @@ pub fn data_folders(tree: &Tree, library: &Path, bundle_id: &str, name: &str) ->
         let Some(dir) = tree.find(&library.join(sub)) else {
             continue;
         };
-        for c in tree.children(dir) {
-            let item = tree.display_name(c).to_ascii_lowercase();
+        for (c, _, item) in tree.entries(dir) {
+            let item = item.to_string_lossy().to_ascii_lowercase();
             if matches(&item, rule) && !out.iter().any(|d: &DataFolder| d.id == c) {
                 out.push(DataFolder { id: c, label });
             }
@@ -129,20 +128,21 @@ pub fn data_folders(tree: &Tree, library: &Path, bundle_id: &str, name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{Kind, ROOT};
+    use crate::store::testing::Builder;
+    use crate::store::{Kind, ROOT};
     use std::path::PathBuf;
 
-    fn dir(t: &mut Tree, parent: NodeId, name: &str) -> NodeId {
+    fn dir(t: &mut Builder, parent: NodeId, name: &str) -> NodeId {
         t.add(parent, name.as_bytes(), Kind::Dir, 0, 0, 0)
     }
 
-    fn file(t: &mut Tree, parent: NodeId, name: &str) -> NodeId {
+    fn file(t: &mut Builder, parent: NodeId, name: &str) -> NodeId {
         t.add(parent, name.as_bytes(), Kind::File, 0, 1, 0)
     }
 
     #[test]
     fn apps_are_found_in_subfolders_but_not_inside_other_apps() {
-        let mut t = Tree::new("/".into(), "Macintosh HD", 0);
+        let mut t = Builder::new("/", "Macintosh HD");
         let apps = dir(&mut t, ROOT, "Applications");
         let foo = t.add(apps, b"Foo.app", Kind::Dir, flags::PACKAGE, 0, 0);
         let helpers = dir(&mut t, foo, "Helpers");
@@ -150,15 +150,16 @@ mod tests {
         let utilities = dir(&mut t, apps, "Utilities");
         let bar = t.add(utilities, b"Bar.app", Kind::Dir, flags::PACKAGE, 0, 0);
         t.add(apps, b"Notes.rtfd", Kind::Dir, flags::PACKAGE, 0, 0);
-        let mut found = find_apps(&t, Path::new("/Applications"));
+        let s = t.build();
+        let mut found: Vec<NodeId> = find_apps(&s, Path::new("/Applications")).into_iter().map(|id| s.added(id)).collect();
         found.sort();
         assert_eq!(found, vec![foo, bar]);
-        assert!(find_apps(&t, Path::new("/Missing")).is_empty());
+        assert!(find_apps(&s, Path::new("/Missing")).is_empty());
     }
 
     #[test]
     fn an_apps_data_is_found_in_every_library_location() {
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let lib = dir(&mut t, ROOT, "Library");
         let support = dir(&mut t, lib, "Application Support");
         let by_id = dir(&mut t, support, "com.foo.Bar");
@@ -176,20 +177,21 @@ mod tests {
         let http = dir(&mut t, lib, "HTTPStorages");
         let cookies = file(&mut t, http, "com.foo.Bar.binarycookies");
 
-        let found = data_folders(&t, Path::new("/Users/me/Library"), "com.foo.Bar", "Bar");
-        let mut ids: Vec<NodeId> = found.iter().map(|d| d.id).collect();
+        let s = t.build();
+        let found = data_folders(&s, Path::new("/Users/me/Library"), "com.foo.Bar", "Bar");
+        let mut ids: Vec<NodeId> = found.iter().map(|d| s.added(d.id)).collect();
         ids.sort();
         let mut expected = vec![by_id, by_name, cache, container, group, plist, state, cookies];
         expected.sort();
         assert_eq!(ids, expected);
-        assert_eq!(found.iter().find(|d| d.id == container).unwrap().label, "Container");
+        assert_eq!(found.iter().find(|d| s.added(d.id) == container).unwrap().label, "Container");
     }
 
     #[test]
     fn similar_names_are_not_attributed_to_the_app() {
         // Uninstalling removes everything matched, so a helper or another vendor's folder
         // with a similar name must never be included.
-        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let mut t = Builder::new("/Users/me", "me");
         let lib = dir(&mut t, ROOT, "Library");
         let support = dir(&mut t, lib, "Application Support");
         dir(&mut t, support, "com.foo.BarHelper");
@@ -201,9 +203,10 @@ mod tests {
         file(&mut t, prefs, "com.foo.Bar.helper.plist");
         let caches = dir(&mut t, lib, "Caches");
         dir(&mut t, caches, "Go");
-        assert!(data_folders(&t, Path::new("/Users/me/Library"), "com.foo.Bar", "Bar").is_empty());
+        let s = t.build();
+        assert!(data_folders(&s, Path::new("/Users/me/Library"), "com.foo.Bar", "Bar").is_empty());
         // Two-letter names would match too much.
-        assert!(data_folders(&t, Path::new("/Users/me/Library"), "com.go", "Go").is_empty());
+        assert!(data_folders(&s, Path::new("/Users/me/Library"), "com.go", "Go").is_empty());
     }
 
     #[test]

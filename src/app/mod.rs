@@ -25,7 +25,7 @@ use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::prelude::*;
 
-use crate::{cache, ops};
+use crate::{ops, store};
 use state::{AppState, Busy, Mode, View, default_locations, home_dir};
 
 pub use state::Session;
@@ -273,8 +273,8 @@ pub fn select_location(mut state: AppState, path: PathBuf) {
 
 #[component]
 fn App() -> Element {
-    let summaries: HashMap<PathBuf, cache::Summary> = use_hook(|| {
-        cache::list(&cache::dir())
+    let summaries: HashMap<PathBuf, store::Summary> = use_hook(|| {
+        store::list(&store::dir())
             .into_iter()
             .map(|s| (s.root.clone(), s))
             .collect()
@@ -323,6 +323,9 @@ fn App() -> Element {
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let sessions: Vec<Arc<Session>> = state.sessions.peek().values().cloned().collect();
+            for s in &sessions {
+                s.store().trim();
+            }
             let busy = sessions.iter().any(|s| s.busy() != Busy::Idle);
             let versions: u64 = sessions
                 .iter()

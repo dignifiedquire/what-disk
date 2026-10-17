@@ -9,13 +9,13 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use super::browser::show_context_menu;
-use super::state::{BrewState, Busy, Session, home_dir, use_app_state, use_list_trigger};
+use super::state::{BrewState, Busy, Session, home_dir, run_list_work, use_app_state, use_list_trigger};
 use super::{format, icon_url};
 use crate::apps::{self, BundleInfo};
 use crate::brew::{self, Brew};
 use crate::ops;
 use crate::temp::{self, Owner};
-use crate::tree::NodeId;
+use crate::store::NodeId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -125,14 +125,14 @@ impl Scans {
             if !path.starts_with(&s.root) {
                 return None;
             }
-            let id = s.tree.read().find(path)?;
+            let id = s.store().find(path)?;
             Some((s, id))
         })
     }
 
     fn size(&self, path: &Path) -> Option<u64> {
         let (s, id) = self.locate(path)?;
-        Some(s.tree.read().size(id))
+        Some(s.store().size(id))
     }
 
     fn covers(&self, path: &Path) -> bool {
@@ -145,7 +145,7 @@ fn app_data(scans: &Scans, library: &Path, info: &BundleInfo) -> Vec<Part> {
     let (Some(id), Some((session, _))) = (&info.id, scans.locate(library)) else {
         return Vec::new();
     };
-    let tree = session.tree.read();
+    let tree = session.store();
     apps::data_folders(&tree, library, id, &info.name)
         .into_iter()
         .map(|d| Part { path: tree.path(d.id), label: d.label.into(), size: Some(tree.size(d.id)) })
@@ -183,7 +183,7 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
             continue;
         };
         let found: Vec<(PathBuf, u64)> = {
-            let tree = session.tree.read();
+            let tree = session.store();
             apps::find_apps(&tree, &folder).into_iter().map(|id| (tree.path(id), tree.size(id))).collect()
         };
         for (path, size) in found.into_iter().filter(|(p, _)| !cask_apps.contains(p)) {
@@ -285,7 +285,7 @@ fn attach_temp_files(scans: &Scans, report: &mut AppsReport) {
         let Some((session, root_id)) = scans.locate(&root) else {
             continue;
         };
-        let tree = session.tree.read();
+        let tree = session.store();
         for id in tree.children(root_id) {
             let path = tree.path(id);
             // Only the owner may remove an item from the shared temporary folders, and helpers
@@ -436,8 +436,7 @@ pub fn AppsView() -> Element {
         };
         async move {
             let home = home_dir();
-            let found = tokio::task::spawn_blocking(move || collect(sessions, &home, brew.as_deref())).await;
-            if let Ok(r) = found {
+            if let Some(r) = run_list_work(move || collect(sessions, &home, brew.as_deref())).await {
                 report.set(Some(r));
             }
         }
@@ -801,7 +800,8 @@ fn UninstallSheet(entries: Vec<AppEntry>, open: Signal<bool>) -> Element {
 mod tests {
     use super::*;
     use crate::brew::{Cask, Formula};
-    use crate::tree::{Kind, ROOT, Tree, flags};
+    use crate::store::testing::Builder;
+    use crate::store::{Kind, ROOT, flags};
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -815,16 +815,16 @@ mod tests {
         assert!(!owned_by_another_user(&tmp.path().join("missing")));
     }
 
-    fn session(root: &str, build: impl FnOnce(&mut Tree)) -> Arc<Session> {
+    fn session(root: &str, build: impl FnOnce(&mut Builder)) -> Arc<Session> {
         let s = Session::new(Path::new(root), "x");
-        let mut tree = Tree::new(root.into(), "x", 0);
+        let mut tree = Builder::new(root, "x");
         build(&mut tree);
-        *s.tree.write() = tree;
+        s.set_store(tree.build().store);
         *s.scanned_at.lock() = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
         Arc::new(s)
     }
 
-    fn dir(t: &mut Tree, parent: NodeId, name: &str) -> NodeId {
+    fn dir(t: &mut Builder, parent: NodeId, name: &str) -> NodeId {
         t.add(parent, name.as_bytes(), Kind::Dir, 0, 0, 0)
     }
 
@@ -905,7 +905,7 @@ mod tests {
                 let mut id = ROOT;
                 for c in path.components().skip(1) {
                     let name = c.as_os_str().as_encoded_bytes();
-                    id = t.children(id).find(|&k| t.name(k).as_encoded_bytes() == name).unwrap_or_else(|| t.add(id, name, Kind::Dir, 0, 0, 0));
+                    id = t.find_child(id, name).unwrap_or_else(|| t.add(id, name, Kind::Dir, 0, 0, 0));
                 }
                 id
             };
