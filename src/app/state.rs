@@ -1,0 +1,371 @@
+//! Application state shared by all components, and the background work that changes it.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::SystemTime;
+
+use dioxus::prelude::*;
+use parking_lot::{Mutex, RwLock};
+
+use crate::cache;
+use crate::scan::{self, Outcome, Progress};
+use crate::tree::{NodeId, ROOT, Tree, flags};
+use crate::volumes::{self, Boundary, Volume};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Busy {
+    Idle,
+    Loading,
+    Scanning,
+    /// A single folder is being rescanned and will replace its old contents when done.
+    Rescanning(NodeId),
+}
+
+/// One scanned root: its tree and the state of work on it.
+pub struct Session {
+    pub root: PathBuf,
+    pub tree: RwLock<Tree>,
+    pub progress: Progress,
+    pub cancel: AtomicBool,
+    pub busy: Mutex<Busy>,
+    /// When the tree was last scanned completely; `None` if the last scan was stopped.
+    pub scanned_at: Mutex<Option<SystemTime>>,
+    /// Incremented by background threads whenever they finish changing the tree.
+    pub version: AtomicU64,
+}
+
+impl Session {
+    fn new(root: &Path, name: &str) -> Self {
+        Session {
+            root: root.to_path_buf(),
+            tree: RwLock::new(Tree::new(root.to_path_buf(), name, 0)),
+            progress: Progress::default(),
+            cancel: AtomicBool::new(false),
+            busy: Mutex::new(Busy::Idle),
+            scanned_at: Mutex::new(None),
+            version: AtomicU64::new(0),
+        }
+    }
+
+    pub fn busy(&self) -> Busy {
+        *self.busy.lock()
+    }
+
+    fn finish(&self) {
+        *self.busy.lock() = Busy::Idle;
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Writes the tree to the cache; failures only cost a rescan next time.
+    pub fn save(&self) {
+        if let Some(at) = *self.scanned_at.lock() {
+            let _ = cache::save(&cache::dir(), &self.tree.read(), at);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LocationKind {
+    Home,
+    Volume(Volume),
+    Folder,
+}
+
+/// An entry in the sidebar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: LocationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Outline,
+    Biggest,
+}
+
+/// What the user is looking at inside the selected location.
+#[derive(Clone, Debug, PartialEq)]
+pub struct View {
+    pub mode: Mode,
+    /// Path from the view root (exclusive) down to the selected item.
+    pub selection: Vec<NodeId>,
+    pub checked: BTreeSet<NodeId>,
+    pub query: String,
+    /// Folders whose list of small items was expanded.
+    pub expanded: BTreeSet<NodeId>,
+    pub fda_dismissed: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View {
+            mode: Mode::Outline,
+            selection: Vec::new(),
+            checked: BTreeSet::new(),
+            query: String::new(),
+            expanded: BTreeSet::new(),
+            fda_dismissed: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct AppState {
+    pub locations: Signal<Vec<Location>>,
+    pub selected: Signal<PathBuf>,
+    pub sessions: Signal<HashMap<PathBuf, Arc<Session>>>,
+    pub summaries: Signal<HashMap<PathBuf, cache::Summary>>,
+    /// Bumped whenever any tree changes, so components that read trees re-render.
+    pub rev: Signal<u64>,
+    pub view: Signal<View>,
+    pub review_open: Signal<bool>,
+    pub context_target: Signal<Option<NodeId>>,
+}
+
+pub fn use_app_state() -> AppState {
+    use_context::<AppState>()
+}
+
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into())
+}
+
+pub fn default_locations(summaries: &HashMap<PathBuf, cache::Summary>) -> Vec<Location> {
+    let home = home_dir();
+    let mut v = vec![Location {
+        name: volumes::display_name(&home),
+        path: home.clone(),
+        kind: LocationKind::Home,
+    }];
+    for vol in volumes::list() {
+        v.push(Location {
+            path: vol.mount.clone(),
+            name: vol.name.clone(),
+            kind: LocationKind::Volume(vol),
+        });
+    }
+    let mut folders: Vec<PathBuf> = ["Desktop", "Documents", "Downloads"]
+        .iter()
+        .map(|f| home.join(f))
+        .collect();
+    // Folders scanned in earlier sessions stay in the sidebar.
+    let mut cached: Vec<&PathBuf> = summaries.keys().collect();
+    cached.sort();
+    for p in cached {
+        if !folders.contains(p) && !v.iter().any(|l| &l.path == p) {
+            folders.push(p.clone());
+        }
+    }
+    for p in folders {
+        v.push(Location {
+            name: volumes::display_name(&p),
+            path: p,
+            kind: LocationKind::Folder,
+        });
+    }
+    v
+}
+
+impl AppState {
+    pub fn location(&self, path: &Path) -> Option<Location> {
+        self.locations.read().iter().find(|l| l.path == path).cloned()
+    }
+
+    pub fn volume_of(&self, path: &Path) -> Option<Volume> {
+        self.locations.read().iter().find_map(|l| match &l.kind {
+            LocationKind::Volume(v) if l.path == path => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    /// The session showing `path`, and the node for `path` inside it. A folder that is part
+    /// of a larger scan (for example Documents inside the startup disk) reuses that scan.
+    pub fn resolve(&self, path: &Path) -> Option<(Arc<Session>, NodeId)> {
+        let sessions = self.sessions.read();
+        if let Some(s) = sessions.get(path) {
+            return Some((s.clone(), ROOT));
+        }
+        let mut candidates: Vec<&Arc<Session>> = sessions
+            .values()
+            .filter(|s| path.starts_with(&s.root) && s.busy() != Busy::Loading)
+            .collect();
+        // Prefer the closest enclosing scan.
+        candidates.sort_by_key(|s| std::cmp::Reverse(s.root.components().count()));
+        candidates
+            .into_iter()
+            .find_map(|s| s.tree.read().find(path).map(|id| (s.clone(), id)))
+    }
+
+    /// Cached root that can show `path`: its own scan, else the closest enclosing one.
+    fn cached_root_for(&self, path: &Path) -> Option<PathBuf> {
+        let summaries = self.summaries.read();
+        if summaries.contains_key(path) {
+            return Some(path.to_path_buf());
+        }
+        summaries
+            .keys()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
+            .cloned()
+    }
+
+    /// Loads the cached scan for `path` if it is not shown by a loaded session yet.
+    pub fn ensure_loaded(mut self, path: &Path) {
+        if self.resolve(path).is_some() {
+            return;
+        }
+        let Some(root) = self.cached_root_for(path) else {
+            return;
+        };
+        if self.sessions.read().contains_key(&root) {
+            return;
+        }
+        let session = Arc::new(Session::new(&root, ""));
+        *session.busy.lock() = Busy::Loading;
+        self.sessions.write().insert(root.clone(), session.clone());
+        std::thread::spawn(move || {
+            match cache::load(&cache::dir(), &root) {
+                Ok((tree, summary)) => {
+                    *session.tree.write() = tree;
+                    *session.scanned_at.lock() = Some(summary.scanned_at);
+                }
+                // An unreadable cache is treated as "not scanned"; the next scan replaces it.
+                Err(_) => {
+                    let _ = cache::remove(&cache::dir(), &root);
+                }
+            }
+            session.finish();
+        });
+    }
+
+    /// Starts a full scan of `path`, replacing any previous result for it.
+    pub fn start_scan(mut self, path: &Path) {
+        let name = self
+            .location(path)
+            .map_or_else(|| volumes::display_name(path), |l| l.name);
+        let session = Arc::new(Session::new(path, &name));
+        *session.busy.lock() = Busy::Scanning;
+        if let Some(old) = self.sessions.write().insert(path.to_path_buf(), session.clone()) {
+            old.cancel.store(true, Ordering::Relaxed);
+        }
+        self.view.set(View::default());
+        std::thread::spawn(move || {
+            let boundary = Arc::new(Boundary::new(&session.root));
+            let outcome = scan::scan(&session.tree, boundary, &session.progress, &session.cancel);
+            if outcome == Outcome::Complete {
+                *session.scanned_at.lock() = Some(SystemTime::now());
+                session.save();
+            }
+            session.finish();
+        });
+    }
+
+    /// Rescans one folder of an existing scan and replaces its contents.
+    pub fn rescan_folder(self, session: Arc<Session>, id: NodeId) {
+        if id == ROOT {
+            self.start_scan(&session.root);
+            return;
+        }
+        if session.busy() != Busy::Idle {
+            return;
+        }
+        let (path, name) = {
+            let t = session.tree.read();
+            (t.path(id), t.display_name(id).into_owned())
+        };
+        *session.busy.lock() = Busy::Rescanning(id);
+        std::thread::spawn(move || {
+            let sub = RwLock::new(Tree::new(path, &name, 0));
+            let boundary = Arc::new(Boundary::new(&session.root));
+            let outcome = scan::scan(&sub, boundary, &Progress::default(), &session.cancel);
+            session.cancel.store(false, Ordering::Relaxed);
+            if outcome == Outcome::Complete {
+                let sub = sub.into_inner();
+                let mut tree = session.tree.write();
+                if tree.is_attached(id) {
+                    tree.graft(id, &sub);
+                }
+                drop(tree);
+                session.save();
+            }
+            session.finish();
+        });
+    }
+
+    pub fn stop(self, session: &Session) {
+        session.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Removes nodes that were deleted on disk from the tree and persists the result.
+    pub fn forget(mut self, session: &Arc<Session>, ids: &[NodeId]) {
+        {
+            let mut tree = session.tree.write();
+            for &id in ids {
+                if tree.is_attached(id) {
+                    tree.remove(id);
+                }
+            }
+        }
+        self.view.with_mut(|v| v.checked.retain(|id| !ids.contains(id)));
+        let s = session.clone();
+        std::thread::spawn(move || s.save());
+        self.rev.with_mut(|r| *r += 1);
+    }
+
+    /// Re-reads cache summaries and volume capacities after background work finished.
+    pub fn refresh_disk_info(mut self) {
+        let summaries: HashMap<PathBuf, cache::Summary> = cache::list(&cache::dir())
+            .into_iter()
+            .map(|s| (s.root.clone(), s))
+            .collect();
+        let locations = default_locations(&summaries);
+        self.summaries.set(summaries);
+        if *self.locations.peek() != locations {
+            self.locations.set(locations);
+        }
+    }
+}
+
+/// Checked items, without items whose ancestor is also checked (deleting the ancestor
+/// deletes them too) and without items that no longer exist.
+pub fn effective_checked(tree: &Tree, checked: &BTreeSet<NodeId>) -> Vec<NodeId> {
+    checked
+        .iter()
+        .copied()
+        .filter(|&id| tree.is_attached(id))
+        .filter(|&id| {
+            let chain = tree.ancestry(id);
+            chain[..chain.len() - 1].iter().all(|a| !checked.contains(a))
+        })
+        .collect()
+}
+
+/// Items that must never be offered for deletion.
+pub fn is_protected(tree: &Tree, id: NodeId) -> bool {
+    id == ROOT || tree.node(id).has(flags::PRUNED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::Kind;
+
+    #[test]
+    fn checking_a_folder_and_its_contents_counts_the_contents_once() {
+        // The removal total must equal the space actually freed, so items inside a checked
+        // folder must not be added again.
+        let mut t = Tree::new("/r".into(), "r", 0);
+        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 0);
+        let inner = t.add(a, b"inner", Kind::File, 0, 10, 0);
+        let other = t.add(ROOT, b"other", Kind::File, 0, 5, 0);
+        let checked: BTreeSet<NodeId> = [a, inner, other].into();
+        assert_eq!(effective_checked(&t, &checked), vec![a, other]);
+
+        t.remove(other);
+        assert_eq!(effective_checked(&t, &checked), vec![a]);
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "what-disk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dioxus = { version = "0.7.7", features = ["desktop"] }
+dua-core = "5"
+libc = "0.2.191"
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+parking_lot = "0.12.5"
+quicklook = "0.2.2"
+rfd = "0.17.2"
+tokio = { version = "1", features = ["time", "rt", "sync"] }
+trash = "5.2.9"
+window-vibrancy = "0.8.1"
+zstd = "0.14.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"

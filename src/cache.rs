@@ -1,0 +1,180 @@
+//! Scan results persisted between runs in `~/Library/Caches/<app>/`.
+//!
+//! File layout (all integers little-endian):
+//! `MAGIC`, a fixed-size [`Header`], the root path, then a zstd stream holding the node array
+//! followed by the names buffer. The header can be read without decompressing the tree, so
+//! the sidebar can show sizes and scan dates of every cached root instantly.
+
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use bytemuck::{Pod, Zeroable};
+
+use crate::tree::{Node, ROOT, Tree};
+
+const MAGIC: &[u8; 8] = b"WHATDSK1";
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Header {
+    scanned_at: u64,
+    total: u64,
+    node_count: u64,
+    names_len: u64,
+    root_path_len: u64,
+}
+
+/// What the sidebar needs to know about a cached scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    pub root: PathBuf,
+    pub total: u64,
+    pub scanned_at: SystemTime,
+}
+
+pub fn dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Caches")
+        .join(crate::BUNDLE_ID)
+}
+
+/// Cache file name for `root`. Uses FNV-1a because it must stay stable across Rust releases.
+fn file_for(dir: &Path, root: &Path) -> PathBuf {
+    let hash = root.as_os_str().as_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    dir.join(format!("{hash:016x}.scan"))
+}
+
+/// Writes `tree` atomically: a crash while saving leaves the previous cache intact.
+pub fn save(dir: &Path, tree: &Tree, scanned_at: SystemTime) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tree = tree.compacted();
+    let (nodes, names) = tree.parts();
+    let root = tree.root_path().as_os_str().as_bytes();
+    let header = Header {
+        scanned_at: scanned_at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        total: tree.size(ROOT),
+        node_count: nodes.len() as u64,
+        names_len: names.len() as u64,
+        root_path_len: root.len() as u64,
+    };
+    let path = file_for(dir, tree.root_path());
+    let tmp = path.with_extension("tmp");
+    {
+        let mut w = BufWriter::new(File::create(&tmp)?);
+        w.write_all(MAGIC)?;
+        w.write_all(bytemuck::bytes_of(&header))?;
+        w.write_all(root)?;
+        let mut z = zstd::Encoder::new(w, 1)?;
+        z.include_checksum(true)?;
+        z.write_all(bytemuck::cast_slice(nodes))?;
+        z.write_all(names)?;
+        z.finish()?.flush()?;
+    }
+    std::fs::rename(tmp, path)
+}
+
+fn read_header(r: &mut impl Read) -> io::Result<(Header, PathBuf)> {
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a scan cache"));
+    }
+    let mut header = Header::zeroed();
+    r.read_exact(bytemuck::bytes_of_mut(&mut header))?;
+    let mut root = vec![0u8; header.root_path_len as usize];
+    r.read_exact(&mut root)?;
+    Ok((header, PathBuf::from(std::ffi::OsStr::from_bytes(&root))))
+}
+
+fn summary(header: &Header, root: PathBuf) -> Summary {
+    Summary {
+        root,
+        total: header.total,
+        scanned_at: UNIX_EPOCH + Duration::from_secs(header.scanned_at),
+    }
+}
+
+/// Summaries of all cached scans; unreadable files are skipped.
+pub fn list(dir: &Path) -> Vec<Summary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "scan"))
+        .filter_map(|e| {
+            let mut r = BufReader::new(File::open(e.path()).ok()?);
+            let (h, root) = read_header(&mut r).ok()?;
+            Some(summary(&h, root))
+        })
+        .collect()
+}
+
+pub fn load(dir: &Path, root: &Path) -> io::Result<(Tree, Summary)> {
+    let mut r = BufReader::new(File::open(file_for(dir, root))?);
+    let (h, cached_root) = read_header(&mut r)?;
+    if cached_root != root {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "cache belongs to another root"));
+    }
+    let mut z = zstd::Decoder::new(r)?;
+    let mut nodes = vec![Node::zeroed(); h.node_count as usize];
+    z.read_exact(bytemuck::cast_slice_mut(&mut nodes))?;
+    let mut names = vec![0u8; h.names_len as usize];
+    z.read_exact(&mut names)?;
+    let tree = Tree::from_parts(cached_root.clone(), nodes, names);
+    Ok((tree, summary(&h, cached_root)))
+}
+
+pub fn remove(dir: &Path, root: &Path) -> io::Result<()> {
+    std::fs::remove_file(file_for(dir, root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{Kind, flags};
+
+    #[test]
+    fn a_saved_scan_loads_back_identically_without_removed_items() {
+        // Reopening the app must show exactly the state the user left, including
+        // deletions made after the scan.
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = Tree::new("/data".into(), "Data", 5);
+        let a = t.add(ROOT, b"a", Kind::Dir, 0, 0, 1);
+        t.add(a, "caf\u{e9}.mov".as_bytes(), Kind::File, 0, 4096, 2);
+        let gone = t.add(a, b"gone.bin", Kind::File, 0, 8192, 3);
+        t.add(ROOT, b"Foo.app", Kind::Dir, flags::PACKAGE, 512, 4);
+        t.remove(gone);
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        save(dir.path(), &t, at).unwrap();
+
+        let (loaded, s) = load(dir.path(), Path::new("/data")).unwrap();
+        assert_eq!(s, Summary { root: "/data".into(), total: 4096 + 512, scanned_at: at });
+        assert_eq!(loaded.size(ROOT), t.size(ROOT));
+        assert_eq!(loaded.display_name(ROOT), "Data");
+        let mov = loaded.find(Path::new("/data/a/caf\u{e9}.mov")).unwrap();
+        assert_eq!((loaded.size(mov), loaded.node(mov).mtime), (4096, 2));
+        assert!(loaded.find(Path::new("/data/a/gone.bin")).is_none());
+        let app = loaded.find(Path::new("/data/Foo.app")).unwrap();
+        assert!(loaded.node(app).has(flags::PACKAGE));
+
+        assert_eq!(list(dir.path()), vec![s]);
+        remove(dir.path(), Path::new("/data")).unwrap();
+        assert!(list(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_cache_is_an_error_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(file_for(dir.path(), Path::new("/x")), b"garbage").unwrap();
+        assert!(load(dir.path(), Path::new("/x")).is_err());
+        assert!(list(dir.path()).is_empty());
+    }
+}
