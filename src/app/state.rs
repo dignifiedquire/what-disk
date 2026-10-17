@@ -183,8 +183,12 @@ pub fn default_locations(summaries: &HashMap<PathBuf, cache::Summary>) -> Vec<Lo
         .iter()
         .map(|f| home.join(f))
         .collect();
-    // Folders scanned in earlier sessions stay in the sidebar.
-    let mut cached: Vec<&PathBuf> = summaries.keys().collect();
+    // Folders scanned in earlier sessions stay in the sidebar, except temporary folders that
+    // the Apps overview scanned for itself.
+    let mut cached: Vec<&PathBuf> = summaries
+        .keys()
+        .filter(|p| !p.starts_with("/private/var/folders") && !p.starts_with("/private/tmp") && !p.starts_with("/private/var/tmp"))
+        .collect();
     cached.sort();
     for p in cached {
         if !folders.contains(p) && !v.iter().any(|l| &l.path == p) {

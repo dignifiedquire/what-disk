@@ -1,7 +1,7 @@
 //! The Apps overview: installed applications and Homebrew packages with the space they and
 //! their data use, and uninstalling them.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use super::{format, icon_url};
 use crate::apps::{self, BundleInfo};
 use crate::brew::{self, Brew};
 use crate::ops;
+use crate::temp::{self, Owner};
 use crate::tree::NodeId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,8 @@ pub enum Group {
     Casks,
     Formulae,
     BrewCache,
+    /// Temporary items no listed app or package claims.
+    Temp,
 }
 
 impl Group {
@@ -35,6 +38,7 @@ impl Group {
             Group::Casks => "Homebrew Casks",
             Group::Formulae => "Homebrew Formulae",
             Group::BrewCache => "Homebrew Cache",
+            Group::Temp => "Temporary Files",
         }
     }
 
@@ -49,6 +53,8 @@ pub enum EntryKind {
     Cask { token: String },
     Formula { name: String },
     BrewCache,
+    /// A group of temporary items with the same owner.
+    Temp,
 }
 
 /// A folder or file that belongs to an entry. `size` is `None` when no scan covers it.
@@ -69,6 +75,8 @@ pub struct AppEntry {
     pub detail: String,
     /// Shown with Finder's icon for this path.
     pub icon: PathBuf,
+    /// Matches temporary items to the app.
+    pub bundle_id: Option<String>,
     /// The app itself: bundles, Cellar or Caskroom folders.
     pub install: Vec<Part>,
     /// What it keeps in ~/Library.
@@ -182,6 +190,7 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
             let info = apps::bundle_info(&path);
             report.entries.push(AppEntry {
                 key: path.clone(),
+                bundle_id: info.id.clone(),
                 group,
                 kind: EntryKind::App,
                 detail: app_detail(&info),
@@ -209,9 +218,11 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
             let room = brew.caskroom(cask);
             install.push(Part { size: scans.size(&room), path: room.clone(), label: "Caskroom".into() });
             let app = apps.into_iter().find(|p| p.exists());
-            let data = app.as_ref().map_or_else(Vec::new, |a| app_data(&scans, &library, &apps::bundle_info(a)));
+            let info = app.as_ref().map(|a| apps::bundle_info(a));
+            let data = info.as_ref().map_or_else(Vec::new, |i| app_data(&scans, &library, i));
             report.entries.push(AppEntry {
                 key: room.clone(),
+                bundle_id: info.and_then(|i| i.id),
                 group: Group::Casks,
                 kind: EntryKind::Cask { token: cask.token.clone() },
                 name: cask.name.clone(),
@@ -229,6 +240,7 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
             }
             report.entries.push(AppEntry {
                 key: cellar.clone(),
+                bundle_id: None,
                 group: Group::Formulae,
                 kind: EntryKind::Formula { name: formula.name.clone() },
                 name: formula.name.clone(),
@@ -242,6 +254,7 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
         if let Some(size) = scans.size(&cache) {
             report.entries.push(AppEntry {
                 key: cache.clone(),
+                bundle_id: None,
                 group: Group::BrewCache,
                 kind: EntryKind::BrewCache,
                 name: "Download cache".into(),
@@ -252,8 +265,66 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
             });
         }
     }
+    attach_temp_files(&scans, &mut report);
     report.entries.sort_by(|a, b| b.total().cmp(&a.total()));
     report
+}
+
+/// Adds each item in the temporary folders to the app or tool it belongs to, so uninstalling
+/// removes it too. The rest is grouped by owner in its own section.
+fn attach_temp_files(scans: &Scans, report: &mut AppsReport) {
+    let ids: Vec<String> = report.entries.iter().filter_map(|e| e.bundle_id.clone()).collect();
+    let mut groups: BTreeMap<String, Vec<Part>> = BTreeMap::new();
+    for (root, kind) in temp::roots() {
+        if !scans.covers(&root) {
+            if root != Path::new("/private/var/tmp") {
+                report.missing.push(root);
+            }
+            continue;
+        }
+        let Some((session, root_id)) = scans.locate(&root) else {
+            continue;
+        };
+        let tree = session.tree.read();
+        for id in tree.children(root_id) {
+            let owner = temp::owner(&tree.display_name(id), &ids);
+            let part = Part { path: tree.path(id), label: kind.label().into(), size: Some(tree.size(id)) };
+            let target = match &owner {
+                Owner::App(bundle) => report.entries.iter_mut().find(|e| e.bundle_id.as_ref() == Some(bundle)),
+                Owner::Tool(tool) => report.entries.iter_mut().find(|e| e.name.eq_ignore_ascii_case(tool)),
+                _ => None,
+            };
+            match target {
+                Some(entry) => entry.data.push(part),
+                None => groups.entry(temp_group_name(&owner)).or_default().push(part),
+            }
+        }
+    }
+    for (name, mut parts) in groups {
+        parts.sort_by(|a, b| b.size.cmp(&a.size));
+        report.entries.push(AppEntry {
+            // Not a path on disk; it only has to be unique.
+            key: PathBuf::from(format!("temporary items/{name}")),
+            bundle_id: None,
+            group: Group::Temp,
+            kind: EntryKind::Temp,
+            detail: format!("{} temporary items", parts.len()),
+            icon: parts[0].path.clone(),
+            name,
+            install: Vec::new(),
+            data: parts,
+        });
+    }
+}
+
+fn temp_group_name(owner: &Owner) -> String {
+    match owner {
+        Owner::App(id) => id.clone(),
+        Owner::Tool(tool) => (*tool).to_string(),
+        Owner::System => "macOS services".into(),
+        Owner::Leftover(id) => format!("{id} (no app in Applications)"),
+        Owner::Other(stem) => stem.clone(),
+    }
 }
 
 /// What uninstalling `entry` does, in words.
@@ -272,6 +343,7 @@ fn action(entry: &AppEntry) -> String {
         EntryKind::Cask { token } => format!("brew uninstall --cask {token}{data}"),
         EntryKind::Formula { name } => format!("brew uninstall {name}"),
         EntryKind::BrewCache => "Move the download cache to the Trash".into(),
+        EntryKind::Temp => format!("Move {} temporary items to the Trash", entry.data.len()),
     }
 }
 
@@ -293,7 +365,9 @@ fn uninstall_blocking(entries: Vec<AppEntry>, brew: Option<PathBuf>) -> (Vec<Pat
         let installed_gone = match &entry.kind {
             EntryKind::Formula { name } => brew.as_deref().ok_or_else(no_brew).and_then(|b| brew::uninstall_formula(b, name)),
             EntryKind::Cask { token } => brew.as_deref().ok_or_else(no_brew).and_then(|b| brew::uninstall_cask(b, token)),
-            EntryKind::App | EntryKind::BrewCache => entry.install.iter().try_for_each(|p| trash(&p.path)),
+            EntryKind::App | EntryKind::BrewCache | EntryKind::Temp => {
+                entry.install.iter().try_for_each(|p| trash(&p.path))
+            }
         };
         if let Err(e) = installed_gone {
             failed.push((entry.name.clone(), e.to_string()));
@@ -309,6 +383,9 @@ fn uninstall_blocking(entries: Vec<AppEntry>, brew: Option<PathBuf>) -> (Vec<Pat
     }
     (removed, failed)
 }
+
+/// Items listed when an entry is expanded; a browser can own hundreds of temporary items.
+const PARTS_SHOWN: usize = 50;
 
 fn short_path(path: &Path) -> String {
     match path.strip_prefix(home_dir()) {
@@ -480,7 +557,13 @@ pub fn AppsView() -> Element {
 #[component]
 fn ScanMissingBanner(roots: Vec<PathBuf>) -> Element {
     let state = use_app_state();
-    let names = roots.iter().map(|p| short_path(p)).collect::<Vec<_>>().join(", ");
+    let temp_roots = temp::roots();
+    let label = |p: &PathBuf| match temp_roots.iter().find(|(root, _)| root == p) {
+        Some((root, _)) if root == Path::new("/private/tmp") => "/tmp".to_string(),
+        Some((_, kind)) => kind.label().to_lowercase(),
+        None => short_path(p),
+    };
+    let names = roots.iter().map(label).collect::<Vec<_>>().join(", ");
     let label = if roots.len() == 1 { "Scan Folder" } else { "Scan These Folders" };
     rsx! {
         div { class: "banner",
@@ -573,8 +656,13 @@ fn AppItem(entry: AppEntry, checked: bool, open: bool, expanded: Signal<BTreeSet
         }
         if open {
             div { class: "app-parts",
-                for part in entry.install.iter().chain(entry.data.iter()).cloned() {
+                for part in entry.install.iter().chain(entry.data.iter()).take(PARTS_SHOWN).cloned() {
                     PartRow { key: "{part.path.display()}", part }
+                }
+                if entry.install.len() + entry.data.len() > PARTS_SHOWN {
+                    div { class: "row part-row more",
+                        "and {entry.install.len() + entry.data.len() - PARTS_SHOWN} more"
+                    }
                 }
             }
         }
@@ -653,6 +741,9 @@ fn UninstallSheet(entries: Vec<AppEntry>, open: Signal<bool>) -> Element {
                     div { class: "sheet-total",
                         span { "Total" }
                         strong { "{format::bytes(total)}" }
+                    }
+                    if entries.iter().any(|e| e.data.iter().any(|p| p.label.starts_with("Temporary"))) {
+                        p { class: "secondary", "Temporary files may be in use; quit the apps they belong to first." }
                     }
                     p { class: "secondary",
                         if uses_brew {
@@ -769,10 +860,61 @@ mod tests {
     fn missing_scans_are_reported_instead_of_zero_sizes() {
         let home_only = session("/Users/me", |_| {});
         let report = collect(vec![home_only], Path::new("/Users/me"), Some(&brew()));
-        // Only the folders needed, not the whole disk.
-        assert_eq!(report.missing, vec![PathBuf::from("/Applications"), PathBuf::from("/opt/homebrew")]);
+        // Only the folders needed, not the whole disk; temporary folders are listed too.
+        let temp_roots: Vec<PathBuf> = temp::roots().into_iter().map(|(p, _)| p).collect();
+        let missing: Vec<&PathBuf> = report.missing.iter().filter(|p| !temp_roots.contains(p)).collect();
+        assert_eq!(missing, vec![&PathBuf::from("/Applications"), &PathBuf::from("/opt/homebrew")]);
+        assert!(!report.missing.contains(&PathBuf::from("/")));
         let zstd = report.entries.iter().find(|e| e.name == "zstd").unwrap();
         assert_eq!(zstd.install_size(), None);
+    }
+
+    #[test]
+    fn temporary_items_go_to_their_app_or_tool_and_the_rest_is_grouped() {
+        // Uninstalling an app should take its temporary files along, and items nobody claims
+        // are still shown instead of hiding in /var/folders.
+        let (temp_dir, _) = temp::roots().into_iter().find(|(_, k)| *k == temp::TempKind::Temp).unwrap();
+        let disk = session("/", |t| {
+            let mut mkdirs = |path: &Path| {
+                let mut id = ROOT;
+                for c in path.components().skip(1) {
+                    let name = c.as_os_str().as_encoded_bytes();
+                    id = t.children(id).find(|&k| t.name(k).as_encoded_bytes() == name).unwrap_or_else(|| t.add(id, name, Kind::Dir, 0, 0, 0));
+                }
+                id
+            };
+            let tmp = mkdirs(Path::new("/private/tmp"));
+            let user_temp = mkdirs(&temp_dir);
+            let claude = t.add(tmp, b"claude-501", Kind::Dir, 0, 0, 0);
+            t.add(claude, b"scratch", Kind::File, 0, 5, 0);
+            t.add(user_temp, b"com.example.app.XyZ12", Kind::File, 0, 7, 0);
+            t.add(user_temp, b"nosh-redir-1-pid", Kind::File, 0, 3, 0);
+        });
+        let entry = |name: &str, bundle_id: Option<&str>| AppEntry {
+            key: PathBuf::from(format!("/Applications/{name}.app")),
+            bundle_id: bundle_id.map(String::from),
+            group: Group::Global,
+            kind: EntryKind::App,
+            name: name.into(),
+            detail: String::new(),
+            icon: "/x".into(),
+            install: vec![],
+            data: vec![],
+        };
+        let mut report = AppsReport {
+            entries: vec![entry("Example", Some("com.example.app")), entry("Claude Code", None)],
+            missing: vec![],
+        };
+        attach_temp_files(&Scans::new(vec![disk]), &mut report);
+
+        let data = |name: &str| -> Vec<(PathBuf, Option<u64>)> {
+            let e = report.entries.iter().find(|e| e.name == name).unwrap();
+            e.data.iter().map(|p| (p.path.clone(), p.size)).collect()
+        };
+        assert_eq!(data("Example"), vec![(temp_dir.join("com.example.app.XyZ12"), Some(7))]);
+        assert_eq!(data("Claude Code"), vec![(PathBuf::from("/private/tmp/claude-501"), Some(5))]);
+        let group = report.entries.iter().find(|e| e.kind == EntryKind::Temp).unwrap();
+        assert_eq!((group.name.as_str(), group.data.len(), group.total()), ("nosh", 1, 3));
     }
 
     #[test]
@@ -785,6 +927,7 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         let entry = AppEntry {
             key: "/x".into(),
+            bundle_id: None,
             group: Group::Global,
             kind: EntryKind::Formula { name: "x".into() },
             name: "X".into(),
@@ -803,6 +946,7 @@ mod tests {
     fn the_sheet_says_what_each_uninstall_does() {
         let mut e = AppEntry {
             key: "/a".into(),
+            bundle_id: None,
             group: Group::Casks,
             kind: EntryKind::Cask { token: "kitty".into() },
             name: "kitty".into(),

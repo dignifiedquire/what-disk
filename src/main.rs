@@ -6,6 +6,7 @@ mod dev;
 mod locations;
 mod ops;
 mod scan;
+mod temp;
 mod tree;
 mod volumes;
 
