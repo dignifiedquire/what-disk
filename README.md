@@ -1,0 +1,63 @@
+# What Disk
+
+A fast disk usage analyzer for macOS, written in Rust with a [Dioxus](https://dioxuslabs.com)
+interface that looks and behaves like a native Mac app.
+
+## Features
+
+- **Scan** a volume, your home folder, or any folder. Scanning runs in parallel and shows
+  results while it runs. Sizes are the space files take on disk, hard links count once,
+  and other volumes are skipped.
+- **Browse** the results in Finder-style columns next to a sunburst chart, or list the
+  biggest files, or search by name.
+- **Remove** files and folders: check them and choose Review and Remove, or right-click.
+  Items go to the Trash, or are deleted immediately after a confirmation.
+- **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
+  location or a single folder when you want fresh numbers.
+- **Projects & Toolchains** lists the build folders of Rust (`target/`) and JavaScript
+  (`node_modules/`) projects, plus toolchain caches and versions (Cargo, rustup, kache,
+  sccache, nvm, Deno, npm, pnpm, Yarn, Bun), across all saved scans.
+- **Apps** lists applications and Homebrew packages with the space they and their data in
+  `~/Library` use, and can uninstall them.
+
+## Requirements
+
+- macOS (Apple silicon or Intel)
+- Rust 1.88 or newer
+
+## Build and run
+
+```sh
+cargo run --release
+```
+
+Run the tests with `cargo test`.
+
+## Permissions
+
+macOS protects some folders, such as Mail, Safari and other apps' containers. Without Full
+Disk Access, What Disk skips them and shows their space as unaccounted. When you start What
+Disk with `cargo run`, it uses your terminal app's permissions, so give the terminal app
+Full Disk Access in System Settings > Privacy & Security > Full Disk Access.
+
+## Data
+
+Saved scans are kept in `~/Library/Caches/com.dignifiedquire.whatdisk`. Deleting that
+folder only means the next start shows no previous scans.
+
+## Development
+
+Debug builds read commands from standard input so the interface can be driven from
+scripts: each line is run as JavaScript in the page and its result is printed, and
+`:open <path>` opens a folder. Release builds do not include this.
+
+| Module | Purpose |
+| --- | --- |
+| `src/scan.rs` | Parallel scanning with `dua-core` |
+| `src/tree.rs` | Compact tree that holds a scan |
+| `src/cache.rs` | Saving and loading scans |
+| `src/volumes.rs` | Volumes and which folders a scan may enter |
+| `src/dev.rs` | Finding project build folders and toolchain caches |
+| `src/apps.rs`, `src/brew.rs` | Applications, their data, and Homebrew |
+| `src/ops.rs` | Trash, delete, Finder, Quick Look and icons |
+| `src/app/` | The user interface |
