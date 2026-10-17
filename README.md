@@ -31,6 +31,10 @@ interface that looks and behaves like a native Mac app.
   - Ruby: gems per Ruby version, RubyGems and Bundler caches, Rubies from rbenv, rvm and
     ruby-install
   - asdf and mise installs, filed under their language
+  - AI: Claude Code transcripts, checkpoints and logs (including MCP logs), Claude desktop's
+    VM, Codex, Gemini CLI, Copilot CLI, opencode, Aider and Continue data, and models from
+    Ollama, LM Studio, Hugging Face (one entry per model), PyTorch, Whisper, llama.cpp and
+    Jan. Each entry says what deleting it costs.
 
   Locations come from each tool's documentation, adjusted by your shell environment (for
   example `CARGO_HOME` or `XDG_CACHE_HOME` set in `.zshrc`) and by asking installed tools

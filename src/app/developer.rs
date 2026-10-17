@@ -303,15 +303,6 @@ pub fn DevToolbar() -> Element {
     } else {
         format!("from scans of {}", roots.join(", "))
     };
-    let segment = move |label: &'static str, value: Option<Language>| {
-        rsx! {
-            button {
-                class: if filter == value { "selected" },
-                onclick: move |_| state.dev_filter.set(value),
-                "{label}"
-            }
-        }
-    };
     rsx! {
         header {
             class: "toolbar",
@@ -321,10 +312,16 @@ pub fn DevToolbar() -> Element {
                 class: "toolbar-controls",
                 onmousedown: move |e| e.stop_propagation(),
                 ondoubleclick: move |e| e.stop_propagation(),
-                div { class: "segmented",
-                    {segment("All", None)}
+                // Too many categories for a segmented control; WebKit draws a native pop-up.
+                select {
+                    class: "popup",
+                    onchange: move |e| {
+                        let chosen = e.value();
+                        state.dev_filter.set(Language::ALL.iter().copied().find(|l| l.label() == chosen));
+                    },
+                    option { value: "", selected: filter.is_none(), "All Categories" }
                     for &language in Language::ALL {
-                        {segment(language.label(), Some(language))}
+                        option { value: language.label(), selected: filter == Some(language), "{language.label()}" }
                     }
                 }
             }

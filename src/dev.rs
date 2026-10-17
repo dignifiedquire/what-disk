@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::locations::{Locations, Root};
 use crate::tree::{NodeId, ROOT, Tree, flags};
-use Language::{C, Go, Java, JavaScript as Js, Python, Ruby, Rust, Swift};
+use Language::{Ai, C, Go, Java, JavaScript as Js, Python, Ruby, Rust, Swift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -19,6 +19,8 @@ pub enum Language {
     Swift,
     Python,
     Ruby,
+    /// AI models, agents and assistants.
+    Ai,
 }
 
 impl Language {
@@ -31,6 +33,7 @@ impl Language {
         Language::Swift,
         Language::Python,
         Language::Ruby,
+        Language::Ai,
     ];
 
     pub fn label(self) -> &'static str {
@@ -43,6 +46,7 @@ impl Language {
             Language::Swift => "Swift",
             Language::Python => "Python",
             Language::Ruby => "Ruby",
+            Language::Ai => "AI",
         }
     }
 
@@ -57,6 +61,7 @@ impl Language {
             Language::Swift => "swift",
             Language::Python => "python",
             Language::Ruby => "ruby",
+            Language::Ai => "ai",
         }
     }
 }
@@ -339,6 +344,8 @@ pub struct GlobalCache {
 const REDOWNLOADED: &str = "Downloaded again when needed";
 const REBUILT: &str = "Rebuilt by the next builds";
 const DEVICE_SUPPORT: &str = "Copied again when the device connects";
+const LOGS: &str = "Logs; safe to delete";
+const HISTORY: &str = "Session history; delete only if you no longer need it";
 
 /// Known cache folders: a configurable root, the folder inside it ("" for the root itself),
 /// and what to call it. Locations follow each tool's documentation for macOS.
@@ -393,6 +400,42 @@ const GLOBAL_CACHES: &[(Root, &str, Language, &str, &str)] = &[
     (Root::RbenvRoot, "cache", Ruby, "ruby-build downloads", REDOWNLOADED),
     (Root::RvmDir, "archives", Ruby, "rvm downloads", REDOWNLOADED),
     (Root::RvmDir, "src", Ruby, "rvm sources", REDOWNLOADED),
+    // Claude Code keeps transcripts, checkpoints and logs for 30 days by default.
+    (Root::ClaudeConfig, "projects", Ai, "Claude Code transcripts", "Session history; resume and rewind need it"),
+    (Root::ClaudeConfig, "file-history", Ai, "Claude Code checkpoints", "Lets sessions rewind file edits"),
+    (Root::ClaudeConfig, "debug", Ai, "Claude Code debug logs", LOGS),
+    (Root::ClaudeConfig, "shell-snapshots", Ai, "Claude Code shell snapshots", "Recreated by the next session"),
+    // MCP server logs are not cleaned up by Claude Code and can grow very large.
+    (Root::Home, "Library/Caches/claude-cli-nodejs", Ai, "Claude Code MCP logs", LOGS),
+    (Root::ClaudeTemp, "", Ai, "Claude Code temporary files", "Scratch files of sessions; delete when none is running"),
+    (
+        Root::Home,
+        "Library/Application Support/Claude/vm_bundles",
+        Ai,
+        "Claude desktop VM",
+        "Downloaded again; quit Claude first, its installed packages are lost",
+    ),
+    (Root::CodexHome, "sessions", Ai, "Codex sessions", HISTORY),
+    (Root::CodexHome, "archived_sessions", Ai, "Codex archived sessions", HISTORY),
+    (Root::CodexHome, "log", Ai, "Codex logs", LOGS),
+    (Root::CodexHome, "cache", Ai, "Codex cache", REDOWNLOADED),
+    (Root::CodexHome, "worktrees", Ai, "Codex worktrees", "Working copies from the Codex app; check for unsaved work"),
+    (Root::GeminiHome, "tmp", Ai, "Gemini CLI sessions", "Chats, checkpoints and shell history; kept 30 days by default"),
+    (Root::CopilotHome, "logs", Ai, "Copilot CLI logs", LOGS),
+    (Root::CopilotHome, "session-state", Ai, "Copilot CLI sessions", HISTORY),
+    (Root::Home, ".cache/opencode", Ai, "opencode cache", REDOWNLOADED),
+    (Root::Home, ".local/share/opencode/log", Ai, "opencode logs", LOGS),
+    (Root::Home, ".aider/caches", Ai, "Aider cache", REBUILT),
+    (Root::ContinueHome, "index", Ai, "Continue index", REBUILT),
+    (Root::OllamaModels, "", Ai, "Ollama models", "Pulled models download again; remove single ones with ollama rm"),
+    (Root::LmStudioHome, "models", Ai, "LM Studio models", "Download again in LM Studio"),
+    (Root::HfHome, "xet", Ai, "Hugging Face download cache", REDOWNLOADED),
+    (Root::TorchHub, "", Ai, "PyTorch hub models", REDOWNLOADED),
+    (Root::Whisper, "", Ai, "Whisper models", REDOWNLOADED),
+    (Root::LlamaCache, "", Ai, "llama.cpp downloads", REDOWNLOADED),
+    (Root::Home, "Library/Application Support/Jan/data/llamacpp/models", Ai, "Jan models", REDOWNLOADED),
+    (Root::Home, "Library/Application Support/Jan/data/mlx/models", Ai, "Jan models", REDOWNLOADED),
+    (Root::Home, "pinokio", Ai, "Pinokio", "Apps, environments and models installed through Pinokio"),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
@@ -492,6 +535,20 @@ pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache
         for id in versions {
             let name = without_xcode_suffix(&tree.display_name(id)).to_string();
             add(GlobalCache { id, language, label: format!("{label} {name}"), note });
+        }
+    }
+    // The Hugging Face hub keeps one folder per model or dataset: models--org--name.
+    if let Some(hub) = tree.find(&locations.root(Root::HfHub)) {
+        for id in tree.children(hub).filter(|&c| tree.node(c).is_dir()) {
+            let name = tree.display_name(id);
+            let (kind, repo) = match name.split_once("--") {
+                Some(("models", repo)) => ("model", repo),
+                Some(("datasets", repo)) => ("dataset", repo),
+                Some(("spaces", repo)) => ("space", repo),
+                _ => continue,
+            };
+            let label = format!("Hugging Face {kind} {}", repo.replacen("--", "/", 1));
+            add(GlobalCache { id, language: Ai, label, note: REDOWNLOADED });
         }
     }
     for &(root, rel, manager) in VERSION_MANAGERS {
@@ -1015,6 +1072,38 @@ mod tests {
         assert!(found.contains(&(node22, Language::JavaScript, "JavaScript 22.1.0 (mise)".into())));
         // The user's own project in ~/src and languages without a section are not listed.
         assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn ai_tool_data_is_listed_and_hugging_face_models_one_by_one() {
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let claude = t.add(ROOT, b".claude", Kind::Dir, flags::HIDDEN, 0, 0);
+        let transcripts = dir(&mut t, claude, "projects");
+        dir(&mut t, claude, "settings-are-not-listed");
+        let library = dir(&mut t, ROOT, "Library");
+        let caches = dir(&mut t, library, "Caches");
+        let mcp = dir(&mut t, caches, "claude-cli-nodejs");
+        let dot_cache = t.add(ROOT, b".cache", Kind::Dir, flags::HIDDEN, 0, 0);
+        let hf = dir(&mut t, dot_cache, "huggingface");
+        let hub = dir(&mut t, hf, "hub");
+        let model = dir(&mut t, hub, "models--mlx-community--Qwen3-8B-4bit");
+        let dataset = dir(&mut t, hub, "datasets--org--data");
+        t.add(hub, b".locks", Kind::Dir, flags::HIDDEN, 0, 0);
+        let mut found: Vec<(NodeId, String)> =
+            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+                .into_iter()
+                .filter(|c| c.language == Language::Ai)
+                .map(|c| (c.id, c.label))
+                .collect();
+        found.sort();
+        let mut expected = vec![
+            (transcripts, "Claude Code transcripts".to_string()),
+            (mcp, "Claude Code MCP logs".to_string()),
+            (model, "Hugging Face model mlx-community/Qwen3-8B-4bit".to_string()),
+            (dataset, "Hugging Face dataset org/data".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]

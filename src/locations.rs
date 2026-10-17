@@ -62,6 +62,20 @@ pub enum Root {
     RvmDir,
     AsdfData,
     MiseData,
+    ClaudeConfig,
+    /// Claude Code's temporary folder for this user.
+    ClaudeTemp,
+    CodexHome,
+    GeminiHome,
+    CopilotHome,
+    ContinueHome,
+    OllamaModels,
+    LmStudioHome,
+    HfHome,
+    HfHub,
+    TorchHub,
+    Whisper,
+    LlamaCache,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -262,6 +276,40 @@ impl Locations {
             Root::MiseData => var("MISE_DATA_DIR")
                 .or_else(|| self.xdg("XDG_DATA_HOME", "mise"))
                 .unwrap_or_else(|| home(".local/share/mise")),
+            Root::ClaudeConfig => var("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home(".claude")),
+            Root::ClaudeTemp => {
+                // SAFETY: getuid cannot fail.
+                let uid = unsafe { libc::getuid() };
+                var("CLAUDE_CODE_TMPDIR")
+                    .unwrap_or_else(|| PathBuf::from("/private/tmp"))
+                    .join(format!("claude-{uid}"))
+            }
+            Root::CodexHome => var("CODEX_HOME").unwrap_or_else(|| home(".codex")),
+            Root::GeminiHome => var("GEMINI_CLI_HOME").map_or_else(|| home(".gemini"), |p| p.join(".gemini")),
+            Root::CopilotHome => var("COPILOT_HOME").unwrap_or_else(|| home(".copilot")),
+            Root::ContinueHome => var("CONTINUE_GLOBAL_DIR").unwrap_or_else(|| home(".continue")),
+            Root::OllamaModels => var("OLLAMA_MODELS").unwrap_or_else(|| home(".ollama/models")),
+            // LM Studio records its home in a pointer file; older versions used ~/.cache.
+            Root::LmStudioHome => std::fs::read_to_string(home(".lmstudio-home-pointer"))
+                .ok()
+                .map(|s| PathBuf::from(s.trim()))
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| {
+                    let legacy = home(".cache/lm-studio");
+                    if legacy.is_dir() { legacy } else { home(".lmstudio") }
+                }),
+            Root::HfHome => var("HF_HOME")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "huggingface"))
+                .unwrap_or_else(|| home(".cache/huggingface")),
+            Root::HfHub => var("HF_HUB_CACHE")
+                .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
+                .unwrap_or_else(|| self.root(Root::HfHome).join("hub")),
+            Root::TorchHub => var("TORCH_HOME")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "torch"))
+                .unwrap_or_else(|| home(".cache/torch"))
+                .join("hub"),
+            Root::Whisper => self.xdg("XDG_CACHE_HOME", "whisper").unwrap_or_else(|| home(".cache/whisper")),
+            Root::LlamaCache => var("LLAMA_CACHE").unwrap_or_else(|| home("Library/Caches/llama.cpp")),
         }
     }
 

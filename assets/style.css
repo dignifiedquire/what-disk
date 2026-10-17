@@ -288,6 +288,11 @@ input:focus-visible,
   color: var(--tertiary);
 }
 
+.popup {
+  font: inherit;
+  min-width: 150px;
+}
+
 .segmented {
   display: inline-flex;
   padding: 2px;
@@ -1018,6 +1023,11 @@ input:focus-visible,
   background: rgba(204, 52, 45, 0.13);
 }
 
+.badge.ai {
+  color: #0f7b6c;
+  background: rgba(20, 160, 140, 0.14);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.rust {
     color: #ff8a50;
@@ -1057,6 +1067,11 @@ input:focus-visible,
   .badge.ruby {
     color: #ff8a84;
     background: rgba(255, 138, 132, 0.16);
+  }
+
+  .badge.ai {
+    color: #4fd1bd;
+    background: rgba(79, 209, 189, 0.16);
   }
 }
 
