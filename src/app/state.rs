@@ -12,6 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::brew::{self, Brew};
 use crate::cache;
 use crate::dev::Language;
+use crate::locations::Locations;
 use crate::scan::{self, Outcome, Progress};
 use crate::tree::{NodeId, ROOT, Tree, flags};
 use crate::volumes::{self, Boundary, Volume};
@@ -151,6 +152,9 @@ pub struct AppState {
     /// Entries checked for uninstalling in the Apps overview, by their key path.
     pub apps_checked: Signal<BTreeSet<PathBuf>>,
     pub brew: Signal<BrewState>,
+    /// Where developer tools keep their data: the documented defaults until discovery has
+    /// asked the user's shell and the tools.
+    pub tool_locations: Signal<Arc<Locations>>,
 }
 
 pub fn use_app_state() -> AppState {
@@ -378,6 +382,16 @@ impl AppState {
                 Ok(Err(e)) => BrewState::Unavailable(e.to_string()),
                 Err(e) => BrewState::Unavailable(e.to_string()),
             });
+        });
+    }
+
+    /// Finds where developer tools keep their data, in the background.
+    pub fn discover_locations(mut self) {
+        spawn(async move {
+            let home = home_dir();
+            if let Ok(found) = tokio::task::spawn_blocking(move || Locations::discover(&home)).await {
+                self.tool_locations.set(Arc::new(found));
+            }
         });
     }
 

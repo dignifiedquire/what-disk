@@ -263,6 +263,7 @@ fn App() -> Element {
         dev_filter: Signal::new(None),
         apps_checked: Signal::new(Default::default()),
         brew: Signal::new(state::BrewState::NotLoaded),
+        tool_locations: Signal::new(Arc::new(crate::locations::Locations::defaults(&home_dir()))),
     });
     use_hook(native_chrome);
     #[cfg(debug_assertions)]
@@ -278,6 +279,7 @@ fn App() -> Element {
         }
     });
     use_hook(move || state.ensure_loaded(&first));
+    use_hook(move || state.discover_locations());
 
     // Background threads cannot touch signals, so poll their progress while they work.
     use_future(move || async move {
@@ -354,7 +356,8 @@ fn App() -> Element {
 /// Debug builds only: drives the UI from scripts, since this view cannot be scripted through
 /// accessibility without extra permissions. Each line on stdin is evaluated as JavaScript in
 /// the page and its result printed to stdout; `:open <path>` adds and selects a folder, which
-/// otherwise needs the native open panel.
+/// otherwise needs the native open panel; `:locations` prints what the tools reported about
+/// where they keep their data.
 #[cfg(debug_assertions)]
 fn use_debug_console(state: AppState) {
     use_future(move || async move {
@@ -370,6 +373,12 @@ fn use_debug_console(state: AppState) {
             if let Some(path) = line.strip_prefix(":open ") {
                 open_folder(state, PathBuf::from(path.trim()));
                 println!("ok");
+            } else if line.trim() == ":locations" {
+                let locations = state.tool_locations.peek().clone();
+                let mut reported: Vec<String> =
+                    locations.reported().iter().map(|(root, path)| format!("{root:?} = {}", path.display())).collect();
+                reported.sort();
+                println!("{}", reported.join("\n"));
             } else {
                 let result = document::eval(&line).await;
                 println!("{result:?}");

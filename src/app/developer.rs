@@ -12,6 +12,7 @@ use super::browser::show_context_menu;
 use super::state::{AppState, Busy, Session, home_dir, use_app_state, use_list_trigger};
 use super::{format, icon_url};
 use crate::dev::{self, ArtifactKind, Language};
+use crate::locations::Locations;
 
 /// One removable folder: a project's build folder or a global cache.
 #[derive(Clone, Debug, PartialEq)]
@@ -38,7 +39,7 @@ impl DevRow {
 }
 
 /// Rows from all loaded scans. Where scans overlap, the most recent scan's numbers win.
-pub fn collect(mut sessions: Vec<Arc<Session>>, home: &Path) -> Vec<DevRow> {
+pub fn collect(mut sessions: Vec<Arc<Session>>, locations: &Locations) -> Vec<DevRow> {
     sessions.retain(|s| s.busy() != Busy::Loading);
     sessions.sort_by_key(|s| std::cmp::Reverse(*s.scanned_at.lock()));
     let mut seen = HashSet::new();
@@ -64,7 +65,7 @@ pub fn collect(mut sessions: Vec<Arc<Session>>, home: &Path) -> Vec<DevRow> {
                 }
             }
         }
-        for c in dev::find_global_caches(&tree, home) {
+        for c in dev::find_global_caches(&tree, locations) {
             let path = tree.path(c.id);
             if tree.size(c.id) > 0 && seen.insert(path.clone()) {
                 rows.push(DevRow {
@@ -113,9 +114,10 @@ fn use_rows(state: AppState) -> (Signal<Vec<DevRow>>, Signal<bool>) {
     use_resource(move || {
         let _ = trigger();
         let sessions: Vec<Arc<Session>> = state.sessions.read().values().cloned().collect();
+        let locations = state.tool_locations.read().clone();
         async move {
             computing.set(true);
-            let found = tokio::task::spawn_blocking(move || collect(sessions, &home_dir()))
+            let found = tokio::task::spawn_blocking(move || collect(sessions, &locations))
                 .await
                 .unwrap_or_default();
             rows.set(found);
@@ -361,7 +363,7 @@ mod tests {
             rust_project(t, work, "app", 5_000);
         });
         let new = session("/Users/me/work", 200, |t| rust_project(t, ROOT, "app", 9_000));
-        let rows = collect(vec![old, new], Path::new("/nonexistent-home"));
+        let rows = collect(vec![old, new], &Locations::defaults(Path::new("/nonexistent-home")));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, PathBuf::from("/Users/me/work/app/target"));
         assert_eq!((rows[0].size, rows[0].newest), (9_000, 7));
@@ -374,7 +376,7 @@ mod tests {
             rust_project(t, ROOT, "small", 10);
             rust_project(t, ROOT, "big", 1_000);
         });
-        let rows = collect(vec![s], Path::new("/nonexistent-home"));
+        let rows = collect(vec![s], &Locations::defaults(Path::new("/nonexistent-home")));
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, vec!["big", "small"]);
     }
@@ -383,6 +385,6 @@ mod tests {
     fn scans_that_are_still_loading_are_skipped() {
         let s = session("/w", 1, |t| rust_project(t, ROOT, "app", 10));
         *s.busy.lock() = Busy::Loading;
-        assert!(collect(vec![s], Path::new("/nonexistent-home")).is_empty());
+        assert!(collect(vec![s], &Locations::defaults(Path::new("/nonexistent-home"))).is_empty());
     }
 }

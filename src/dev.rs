@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::locations::{Locations, Root};
 use crate::tree::{NodeId, ROOT, Tree, flags};
+use Language::{C, Go, Java, JavaScript as Js, Rust, Swift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -255,67 +257,76 @@ pub struct GlobalCache {
 
 const REDOWNLOADED: &str = "Downloaded again when needed";
 const REBUILT: &str = "Rebuilt by the next builds";
-
-/// Known cache folders, relative to the home folder.
-const GLOBAL_CACHES: &[(&str, Language, &str, &str)] = &[
-    (".cargo/registry", Language::Rust, "Cargo registry", REDOWNLOADED),
-    (".cargo/git", Language::Rust, "Cargo git checkouts", REDOWNLOADED),
-    (".rustup/downloads", Language::Rust, "rustup downloads", REDOWNLOADED),
-    ("Library/Caches/Mozilla.sccache", Language::Rust, "sccache", REBUILT),
-    ("Library/Caches/kache", Language::Rust, "kache", REBUILT),
-    (".npm", Language::JavaScript, "npm cache", REDOWNLOADED),
-    ("Library/pnpm/store", Language::JavaScript, "pnpm store", REDOWNLOADED),
-    (".pnpm-store", Language::JavaScript, "pnpm store", REDOWNLOADED),
-    ("Library/Caches/Yarn", Language::JavaScript, "Yarn cache", REDOWNLOADED),
-    (".yarn/berry/cache", Language::JavaScript, "Yarn cache", REDOWNLOADED),
-    (".bun/install/cache", Language::JavaScript, "Bun cache", REDOWNLOADED),
-    (".nvm/.cache", Language::JavaScript, "nvm downloads", REDOWNLOADED),
-    ("Library/Caches/deno", Language::JavaScript, "Deno cache", REDOWNLOADED),
-    ("go/pkg/mod", Language::Go, "Go module cache", REDOWNLOADED),
-    ("Library/Caches/go-build", Language::Go, "Go build cache", REBUILT),
-    ("Library/Caches/golangci-lint", Language::Go, "golangci-lint cache", REBUILT),
-    (".m2/repository", Language::Java, "Maven repository", REDOWNLOADED),
-    (".gradle/caches", Language::Java, "Gradle caches", REDOWNLOADED),
-    ("Library/Caches/ccache", Language::C, "ccache", REBUILT),
-    (".ccache", Language::C, "ccache", REBUILT),
-    (".conan2/p", Language::C, "Conan packages", REDOWNLOADED),
-    (".conan/data", Language::C, "Conan packages", REDOWNLOADED),
-    (".cache/vcpkg/archives", Language::C, "vcpkg binary cache", REBUILT),
-    ("Library/Caches/org.swift.swiftpm", Language::Swift, "SwiftPM cache", REDOWNLOADED),
-    ("Library/Developer/CoreSimulator/Caches", Language::Swift, "Simulator caches", REBUILT),
-];
-
 const DEVICE_SUPPORT: &str = "Copied again when the device connects";
+
+/// Known cache folders: a configurable root, the folder inside it ("" for the root itself),
+/// and what to call it. Locations follow each tool's documentation for macOS.
+const GLOBAL_CACHES: &[(Root, &str, Language, &str, &str)] = &[
+    (Root::CargoHome, "registry", Rust, "Cargo registry", REDOWNLOADED),
+    (Root::CargoHome, "git", Rust, "Cargo git checkouts", REDOWNLOADED),
+    (Root::RustupHome, "downloads", Rust, "rustup downloads", REDOWNLOADED),
+    (Root::Sccache, "", Rust, "sccache", REBUILT),
+    (Root::Kache, "", Rust, "kache", REBUILT),
+    (Root::NpmCache, "", Js, "npm cache", REDOWNLOADED),
+    (Root::PnpmStore, "", Js, "pnpm store", REDOWNLOADED),
+    (Root::Home, ".pnpm-store", Js, "pnpm store", REDOWNLOADED),
+    (Root::PnpmCache, "", Js, "pnpm metadata cache", REDOWNLOADED),
+    (Root::YarnCache, "", Js, "Yarn cache", REDOWNLOADED),
+    (Root::YarnBerryCache, "", Js, "Yarn cache", REDOWNLOADED),
+    (Root::BunCache, "", Js, "Bun cache", REDOWNLOADED),
+    (Root::NvmDir, ".cache", Js, "nvm downloads", REDOWNLOADED),
+    (Root::Corepack, "", Js, "Corepack cache", REDOWNLOADED),
+    // Not the whole Deno folder: location_data holds the localStorage of Deno programs.
+    (Root::DenoDir, "remote", Js, "Deno remote modules", REDOWNLOADED),
+    (Root::DenoDir, "npm", Js, "Deno npm cache", REDOWNLOADED),
+    (Root::DenoDir, "gen", Js, "Deno compiled code", REBUILT),
+    (Root::GoModCache, "", Go, "Go module cache", REDOWNLOADED),
+    (Root::GoBuildCache, "", Go, "Go build cache", REBUILT),
+    (Root::GolangciLint, "", Go, "golangci-lint cache", REBUILT),
+    (Root::MavenRepository, "", Java, "Maven repository", REDOWNLOADED),
+    (Root::GradleHome, "caches", Java, "Gradle caches", REDOWNLOADED),
+    (Root::Coursier, "", Java, "Coursier cache", REDOWNLOADED),
+    (Root::Ccache, "", C, "ccache", REBUILT),
+    (Root::ConanHome, "p", C, "Conan packages", REDOWNLOADED),
+    (Root::Home, ".conan/data", C, "Conan 1 packages", REDOWNLOADED),
+    (Root::VcpkgCache, "", C, "vcpkg binary cache", REBUILT),
+    (Root::Bazel, "", C, "Bazel output", REBUILT),
+    (Root::BazelLegacy, "", C, "Bazel output", REBUILT),
+    (Root::Home, "Library/Caches/org.swift.swiftpm", Swift, "SwiftPM cache", REDOWNLOADED),
+    (Root::Home, "Library/Developer/CoreSimulator/Caches", Swift, "Simulator caches", REBUILT),
+    (Root::Home, "Library/Developer/Xcode/UserData/Previews", Swift, "SwiftUI previews", REBUILT),
+    (Root::Home, "Library/Caches/com.apple.dt.Xcode", Swift, "Xcode cache", REBUILT),
+];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
 /// versions tend to pile up. Only subfolders whose name starts with the given prefix count.
-const TOOLCHAINS: &[(&str, Language, &str, &str, &str)] = &[
-    (".rustup/toolchains", Language::Rust, "rustup toolchain", "Reinstall with rustup", ""),
-    (".nvm/versions/node", Language::JavaScript, "Node.js", "Reinstall with nvm", ""),
+/// An absolute folder stays absolute when joined to its root.
+const TOOLCHAINS: &[(Root, &str, Language, &str, &str, &str)] = &[
+    (Root::RustupHome, "toolchains", Rust, "rustup toolchain", "Reinstall with rustup", ""),
+    (Root::NvmDir, "versions/node", Js, "Node.js", "Reinstall with nvm", ""),
+    (Root::FnmDir, "node-versions", Js, "Node.js (fnm)", "Reinstall with fnm", ""),
+    (Root::VoltaHome, "tools/image/node", Js, "Node.js (Volta)", "Reinstall with Volta", ""),
     // golang.org/dl installs SDKs as ~/sdk/go1.22.0; other tools use ~/sdk too.
-    ("sdk", Language::Go, "Go SDK", "Reinstall with golang.org/dl", "go"),
-    (".gradle/wrapper/dists", Language::Java, "Gradle", "Downloaded again by the Gradle wrapper", ""),
-    (".sdkman/candidates/java", Language::Java, "JDK", "Reinstall with sdk install java", ""),
-    ("Library/Java/JavaVirtualMachines", Language::Java, "JDK", "Reinstall the JDK", ""),
-    // An absolute path stays absolute when joined to the home folder.
+    (Root::Home, "sdk", Go, "Go SDK", "Reinstall with golang.org/dl", "go"),
+    (Root::GradleHome, "wrapper/dists", Java, "Gradle", "Downloaded again by the Gradle wrapper", ""),
+    (Root::GradleHome, "jdks", Java, "JDK (Gradle)", "Downloaded again by Gradle", ""),
+    (Root::SdkmanDir, "candidates/java", Java, "JDK", "Reinstall with sdk install java", ""),
+    (Root::Home, "Library/Java/JavaVirtualMachines", Java, "JDK", "Reinstall the JDK", ""),
     (
+        Root::Home,
         "/Library/Java/JavaVirtualMachines",
-        Language::Java,
+        Java,
         "JDK",
         "Reinstall the JDK; removing it needs an administrator",
         "",
     ),
-    ("Library/Developer/Xcode/DerivedData", Language::Swift, "Xcode build data", REBUILT, ""),
-    ("Library/Developer/Xcode/iOS DeviceSupport", Language::Swift, "iOS device support", DEVICE_SUPPORT, ""),
-    (
-        "Library/Developer/Xcode/watchOS DeviceSupport",
-        Language::Swift,
-        "watchOS device support",
-        DEVICE_SUPPORT,
-        "",
-    ),
-    ("Library/Developer/Toolchains", Language::Swift, "Swift toolchain", "Reinstall from swift.org", ""),
-    (".swiftly/toolchains", Language::Swift, "Swift toolchain", "Reinstall with swiftly", ""),
+    (Root::Home, "Library/Caches/Coursier/jvm", Java, "JDK (Coursier)", REDOWNLOADED, ""),
+    (Root::Home, "Library/Developer/Xcode/DerivedData", Swift, "Xcode build data", REBUILT, ""),
+    (Root::Home, "Library/Developer/Xcode/iOS DeviceSupport", Swift, "iOS device support", DEVICE_SUPPORT, ""),
+    (Root::Home, "Library/Developer/Xcode/watchOS DeviceSupport", Swift, "watchOS device support", DEVICE_SUPPORT, ""),
+    (Root::Home, "Library/Developer/Xcode/tvOS DeviceSupport", Swift, "tvOS device support", DEVICE_SUPPORT, ""),
+    // swift.org installers and swiftly both install here on macOS.
+    (Root::Home, "Library/Developer/Toolchains", Swift, "Swift toolchain", "Reinstall with swiftly or from swift.org", ""),
 ];
 
 /// "MyApp-abcdefghijklmnopqrstuvwxyzab" -> "MyApp": Xcode appends 28 random letters to the
@@ -331,30 +342,30 @@ fn without_xcode_suffix(name: &str) -> &str {
     }
 }
 
-/// Global caches and installed toolchain versions of the user whose home folder is `home`,
-/// if this tree contains them. Default locations only: a GUI app does not see overrides such
-/// as `SCCACHE_DIR` or `DENO_DIR` from the shell.
-pub fn find_global_caches(tree: &Tree, home: &Path) -> Vec<GlobalCache> {
-    let mut out: Vec<GlobalCache> = GLOBAL_CACHES
-        .iter()
-        .filter_map(|&(rel, language, label, note)| {
-            let id = tree.find(&home.join(rel))?;
-            Some(GlobalCache { id, language, label: label.into(), note })
-        })
-        .collect();
-    for &(rel, language, label, note, prefix) in TOOLCHAINS {
-        if let Some(parent) = tree.find(&home.join(rel)) {
-            let versions = tree.children(parent).filter(|&c| {
-                tree.node(c).is_dir() && tree.name(c).as_bytes().starts_with(prefix.as_bytes())
-            });
-            out.extend(versions.map(|id| {
-                GlobalCache {
-                    id,
-                    language,
-                    label: format!("{label} {}", without_xcode_suffix(&tree.display_name(id))),
-                    note,
-                }
-            }));
+/// Global caches and installed toolchain versions, wherever `locations` says they are, if
+/// this tree contains them.
+pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache> {
+    let mut out: Vec<GlobalCache> = Vec::new();
+    let mut add = |cache: GlobalCache| {
+        if !out.iter().any(|c| c.id == cache.id) {
+            out.push(cache);
+        }
+    };
+    for &(root, rel, language, label, note) in GLOBAL_CACHES {
+        if let Some(id) = tree.find(&locations.path(root, rel)) {
+            add(GlobalCache { id, language, label: label.into(), note });
+        }
+    }
+    for &(root, rel, language, label, note, prefix) in TOOLCHAINS {
+        let Some(parent) = tree.find(&locations.path(root, rel)) else {
+            continue;
+        };
+        let versions = tree.children(parent).filter(|&c| {
+            tree.node(c).is_dir() && tree.name(c).as_bytes().starts_with(prefix.as_bytes())
+        });
+        for id in versions {
+            let name = without_xcode_suffix(&tree.display_name(id)).to_string();
+            add(GlobalCache { id, language, label: format!("{label} {name}"), note });
         }
     }
     out
@@ -498,14 +509,17 @@ mod tests {
         let library = dir(&mut t, ROOT, "Library");
         let caches_dir = dir(&mut t, library, "Caches");
         let kache = dir(&mut t, caches_dir, "kache");
-        let deno = dir(&mut t, caches_dir, "deno");
+        let deno_dir = dir(&mut t, caches_dir, "deno");
+        let deno = dir(&mut t, deno_dir, "remote");
+        // Deno programs' localStorage lives next to the caches and must not be offered.
+        dir(&mut t, deno_dir, "location_data");
         let nvm = t.add(ROOT, b".nvm", Kind::Dir, flags::HIDDEN, 0, 0);
         let versions = dir(&mut t, nvm, "versions");
         let node = dir(&mut t, versions, "node");
         let v23 = dir(&mut t, node, "v23.3.0");
         let npm = t.add(ROOT, b".npm", Kind::Dir, flags::HIDDEN, 0, 0);
 
-        let caches = find_global_caches(&t, Path::new("/Users/me"));
+        let caches = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
         let mut ids: Vec<NodeId> = caches.iter().map(|c| c.id).collect();
         ids.sort();
         let mut expected = vec![registry, stable, nightly, kache, deno, v23, npm];
@@ -531,7 +545,7 @@ mod tests {
         // Another tool's SDK in the same folder must not be listed as Go.
         dir(&mut t, sdk, "flutter");
 
-        let caches = find_global_caches(&t, Path::new("/Users/me"));
+        let caches = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
         let go_caches: Vec<(NodeId, &str)> = caches
             .iter()
             .filter(|c| c.language == Language::Go)
@@ -597,7 +611,7 @@ mod tests {
         let dists = dir(&mut t, wrapper, "dists");
         let g85 = dir(&mut t, dists, "gradle-8.5-bin");
 
-        let found = find_global_caches(&t, Path::new("/Users/me"));
+        let found = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")));
         let mut java: Vec<(NodeId, String)> = found
             .iter()
             .filter(|c| c.language == Language::Java)
@@ -663,7 +677,7 @@ mod tests {
         let ccache = dir(&mut t, caches, "ccache");
         let conan = t.add(ROOT, b".conan2", Kind::Dir, flags::HIDDEN, 0, 0);
         let packages = dir(&mut t, conan, "p");
-        let found: Vec<(NodeId, String)> = find_global_caches(&t, Path::new("/Users/me"))
+        let found: Vec<(NodeId, String)> = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
             .into_iter()
             .filter(|c| c.language == Language::C)
             .map(|c| (c.id, c.label))
@@ -694,7 +708,7 @@ mod tests {
         let app = dir(&mut t, derived, "deltachat-ios-dgddllzyrnuofhchphksaujitkre");
         let support = dir(&mut t, xcode, "iOS DeviceSupport");
         let ios = dir(&mut t, support, "17.1 (21B80)");
-        let labels: Vec<(NodeId, String)> = find_global_caches(&t, Path::new("/Users/me"))
+        let labels: Vec<(NodeId, String)> = find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
             .into_iter()
             .filter(|c| c.language == Language::Swift)
             .map(|c| (c.id, c.label))

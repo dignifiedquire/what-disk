@@ -25,6 +25,10 @@ interface that looks and behaves like a native Mac app.
   - C/C++: ccache, Conan, vcpkg
   - Swift: Xcode DerivedData per project, device support per OS version, simulator and
     SwiftPM caches, Swift toolchains
+
+  Locations come from each tool's documentation, adjusted by your shell environment (for
+  example `CARGO_HOME` or `XDG_CACHE_HOME` set in `.zshrc`) and by asking installed tools
+  such as `go env` or `npm config get cache`.
 - **Apps** lists applications and Homebrew packages with the space they and their data in
   `~/Library` use, and can uninstall them.
 
@@ -56,8 +60,9 @@ folder only means the next start shows no previous scans.
 ## Development
 
 Debug builds read commands from standard input so the interface can be driven from
-scripts: each line is run as JavaScript in the page and its result is printed, and
-`:open <path>` opens a folder. Release builds do not include this.
+scripts: each line is run as JavaScript in the page and its result is printed,
+`:open <path>` opens a folder, and `:locations` prints where the tools said they keep their
+data. Release builds do not include this.
 
 | Module | Purpose |
 | --- | --- |

@@ -3,6 +3,7 @@ mod apps;
 mod brew;
 mod cache;
 mod dev;
+mod locations;
 mod ops;
 mod scan;
 mod tree;
