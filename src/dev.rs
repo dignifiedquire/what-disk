@@ -13,10 +13,12 @@ pub enum Language {
     JavaScript,
     Go,
     Java,
+    C,
 }
 
 impl Language {
-    pub const ALL: &[Language] = &[Language::Rust, Language::JavaScript, Language::Go, Language::Java];
+    pub const ALL: &[Language] =
+        &[Language::Rust, Language::JavaScript, Language::Go, Language::Java, Language::C];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -24,6 +26,7 @@ impl Language {
             Language::JavaScript => "JavaScript",
             Language::Go => "Go",
             Language::Java => "Java",
+            Language::C => "C/C++",
         }
     }
 
@@ -34,6 +37,7 @@ impl Language {
             Language::JavaScript => "js",
             Language::Go => "go",
             Language::Java => "java",
+            Language::C => "c",
         }
     }
 }
@@ -51,6 +55,10 @@ pub enum ArtifactKind {
     GradleBuild,
     /// Gradle's per-project `.gradle/` cache.
     GradleProjectCache,
+    /// A CMake build folder, whatever its name.
+    CMakeBuild,
+    /// A Meson build folder, whatever its name.
+    MesonBuild,
 }
 
 impl ArtifactKind {
@@ -61,6 +69,7 @@ impl ArtifactKind {
             ArtifactKind::MavenTarget | ArtifactKind::GradleBuild | ArtifactKind::GradleProjectCache => {
                 Language::Java
             }
+            ArtifactKind::CMakeBuild | ArtifactKind::MesonBuild => Language::C,
         }
     }
 
@@ -71,6 +80,8 @@ impl ArtifactKind {
             ArtifactKind::MavenTarget => "target",
             ArtifactKind::GradleBuild => "build",
             ArtifactKind::GradleProjectCache => ".gradle",
+            ArtifactKind::CMakeBuild => "CMake build",
+            ArtifactKind::MesonBuild => "Meson build",
         }
     }
 }
@@ -109,7 +120,9 @@ const SYSTEM_FOLDERS: &[&str] = &[
 /// A Rust project is a folder with a `target/` next to `Cargo.toml`, or a `target/` that
 /// Cargo tagged with `CACHEDIR.TAG`. A JavaScript project is a folder with `node_modules/`
 /// next to `package.json`. A Java project has Maven's `target/` next to `pom.xml`, or
-/// Gradle's `build/` and `.gradle/` next to a Gradle build or settings file. Packages, hidden folders, `~/Library` and system folders are not
+/// Gradle's `build/` and `.gradle/` next to a Gradle build or settings file. A C or C++ build
+/// folder is recognised by what CMake or Meson leaves in it, since it can have any name.
+/// Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
 pub fn find_projects(tree: &Tree) -> Vec<Project> {
@@ -119,6 +132,8 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
     while let Some(dir) = stack.pop() {
         let (mut cargo_toml, mut package_json, mut pom_xml) = (false, false, false);
         let (mut gradle_build, mut gradle_settings) = (false, false);
+        let (mut cmake_cache, mut cmake_lists, mut meson_private, mut meson_build) =
+            (false, false, false, false);
         let (mut target, mut node_modules, mut build, mut dot_gradle) = (None, None, None, None);
         for c in tree.children(dir) {
             let is_dir = tree.node(c).is_dir();
@@ -128,12 +143,33 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
                 b"pom.xml" if !is_dir => pom_xml = true,
                 b"build.gradle" | b"build.gradle.kts" if !is_dir => gradle_build = true,
                 b"settings.gradle" | b"settings.gradle.kts" if !is_dir => gradle_settings = true,
+                b"CMakeCache.txt" if !is_dir => cmake_cache = true,
+                b"CMakeLists.txt" if !is_dir => cmake_lists = true,
+                b"meson-private" if is_dir => meson_private = true,
+                b"meson.build" if !is_dir => meson_build = true,
                 b"target" if is_dir => target = Some(c),
                 b"node_modules" if is_dir => node_modules = Some(c),
                 b"build" if is_dir => build = Some(c),
                 b".gradle" if is_dir => dot_gradle = Some(c),
                 _ => {}
             }
+        }
+        // This folder is itself a C/C++ build folder of its parent. An in-source build keeps
+        // its cache next to the sources, so a folder with a CMakeLists.txt or meson.build is
+        // never one: offering it would offer the source code for deletion.
+        let build_kind = if cmake_cache && !cmake_lists {
+            Some(ArtifactKind::CMakeBuild)
+        } else if meson_private && !meson_build {
+            Some(ArtifactKind::MesonBuild)
+        } else {
+            None
+        };
+        if let Some(kind) = build_kind
+            && dir != ROOT
+        {
+            let parent = tree.node(dir).parent;
+            out.push(Project { dir: parent, artifacts: vec![Artifact { id: dir, kind }] });
+            continue;
         }
         let mut artifacts = Vec::new();
         let mut found = |id: Option<NodeId>, kind: ArtifactKind, condition: bool| {
@@ -223,6 +259,11 @@ const GLOBAL_CACHES: &[(&str, Language, &str, &str)] = &[
     ("Library/Caches/golangci-lint", Language::Go, "golangci-lint cache", REBUILT),
     (".m2/repository", Language::Java, "Maven repository", REDOWNLOADED),
     (".gradle/caches", Language::Java, "Gradle caches", REDOWNLOADED),
+    ("Library/Caches/ccache", Language::C, "ccache", REBUILT),
+    (".ccache", Language::C, "ccache", REBUILT),
+    (".conan2/p", Language::C, "Conan packages", REDOWNLOADED),
+    (".conan/data", Language::C, "Conan packages", REDOWNLOADED),
+    (".cache/vcpkg/archives", Language::C, "vcpkg binary cache", REBUILT),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
@@ -526,6 +567,63 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(java, expected);
+    }
+
+    #[test]
+    fn c_build_folders_are_found_by_their_contents_but_never_the_sources() {
+        // CMake and Meson build folders can have any name. An in-source build puts the cache
+        // next to the sources; that folder must not be offered, or the code would be deleted.
+        let mut t = Tree::new("/w".into(), "w", 0);
+        let lib = dir(&mut t, ROOT, "lib");
+        file(&mut t, lib, "CMakeLists.txt", 1, 0);
+        let debug = dir(&mut t, lib, "cmake-build-debug");
+        file(&mut t, debug, "CMakeCache.txt", 1, 0);
+        let nested = dir(&mut t, debug, "_deps");
+        let inner = dir(&mut t, nested, "fmt-build");
+        file(&mut t, inner, "CMakeCache.txt", 1, 0);
+        let meson = dir(&mut t, ROOT, "tool");
+        file(&mut t, meson, "meson.build", 1, 0);
+        let out = dir(&mut t, meson, "out");
+        dir(&mut t, out, "meson-private");
+        let in_source = dir(&mut t, ROOT, "in-source");
+        file(&mut t, in_source, "CMakeLists.txt", 1, 0);
+        file(&mut t, in_source, "CMakeCache.txt", 1, 0);
+        let sub = dir(&mut t, in_source, "sub");
+        file(&mut t, sub, "CMakeLists.txt", 1, 0);
+        let sub_build = dir(&mut t, sub, "build");
+        file(&mut t, sub_build, "CMakeCache.txt", 1, 0);
+
+        let projects = find_projects(&t);
+        let mut builds: Vec<(PathBuf, PathBuf, ArtifactKind)> = projects
+            .iter()
+            .flat_map(|p| p.artifacts.iter().map(move |a| (p.dir, *a)))
+            .map(|(d, a)| (t.path(d), t.path(a.id), a.kind))
+            .collect();
+        builds.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            builds,
+            vec![
+                ("/w/in-source/sub".into(), "/w/in-source/sub/build".into(), ArtifactKind::CMakeBuild),
+                ("/w/lib".into(), "/w/lib/cmake-build-debug".into(), ArtifactKind::CMakeBuild),
+                ("/w/tool".into(), "/w/tool/out".into(), ArtifactKind::MesonBuild),
+            ]
+        );
+    }
+
+    #[test]
+    fn c_caches_are_listed() {
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let library = dir(&mut t, ROOT, "Library");
+        let caches = dir(&mut t, library, "Caches");
+        let ccache = dir(&mut t, caches, "ccache");
+        let conan = t.add(ROOT, b".conan2", Kind::Dir, flags::HIDDEN, 0, 0);
+        let packages = dir(&mut t, conan, "p");
+        let found: Vec<(NodeId, String)> = find_global_caches(&t, Path::new("/Users/me"))
+            .into_iter()
+            .filter(|c| c.language == Language::C)
+            .map(|c| (c.id, c.label))
+            .collect();
+        assert_eq!(found, vec![(ccache, "ccache".into()), (packages, "Conan packages".into())]);
     }
 
     #[test]
