@@ -132,6 +132,10 @@ fn spawn_scan(session: Arc<Session>, folders: Vec<NodeId>) {
     });
 }
 
+pub fn scans_running() -> bool {
+    !RUNNING.lock().is_empty()
+}
+
 /// Pauses running scans and waits up to `limit` for them to save, so they can continue at
 /// the next launch.
 pub fn pause_scans_before_quit(limit: Duration) {

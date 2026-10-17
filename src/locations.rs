@@ -6,7 +6,8 @@
 //! own answer (`go env GOMODCACHE`, `npm config get cache`, ...) overrides both.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -346,9 +347,21 @@ fn deno_dir(output: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// Starts `command` without access to the terminal the app was started from. An interactive
+/// shell takes over that terminal for job control and leaves it to its own process group,
+/// which is gone once the shell exits; Ctrl-C there then no longer reached the app. In a
+/// session of its own the command has no terminal to take.
+fn detached(command: &mut Command) -> &mut Command {
+    // SAFETY: setsid is async-signal-safe, as required between fork and exec.
+    unsafe {
+        command.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
+    }
+    command.stdin(Stdio::null())
+}
+
 /// Runs `command`, returning its standard output if it succeeds within `timeout`.
 fn run(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut child = detached(&mut command).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -505,6 +518,19 @@ mod tests {
             parse_env(b"A=1\0PATH=/bin:/usr/bin\0MULTI=x=y\0"),
             env(&[("A", "1"), ("PATH", "/bin:/usr/bin"), ("MULTI", "x=y")])
         );
+    }
+
+    #[test]
+    fn commands_run_outside_the_apps_terminal_session() {
+        // Otherwise the interactive login shell took over the terminal What Disk was started
+        // from, and Ctrl-C there no longer quit the app.
+        let mut child = detached(&mut Command::new("/bin/sleep")).arg("5").spawn().unwrap();
+        // SAFETY: getsid only reads the session of a process.
+        let (ours, theirs) = unsafe { (libc::getsid(0), libc::getsid(child.id() as libc::pid_t)) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_ne!(theirs, -1);
+        assert_ne!(ours, theirs);
     }
 
     #[test]

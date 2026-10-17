@@ -36,6 +36,7 @@ pub const APP_NAME: &str = "What Disk";
 const QUIT_SAVE_LIMIT: Duration = Duration::from_secs(30);
 
 pub fn launch() {
+    quit_on_signals();
     let window = WindowBuilder::new()
         .with_title(APP_NAME)
         .with_inner_size(LogicalSize::new(1180.0, 760.0))
@@ -58,6 +59,31 @@ pub fn launch() {
             }
         });
     dioxus::LaunchBuilder::desktop().with_cfg(config).launch(App);
+}
+
+/// Ctrl-C in the terminal What Disk was started from, or `kill`, quits like ⌘Q: running scans
+/// are paused and saved first. A second signal quits at once.
+fn quit_on_signals() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut signals = signals.forever();
+        let Some(first) = signals.next() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if state::scans_running() {
+                eprintln!("{APP_NAME}: saving scan progress before quitting; press Ctrl-C again to quit now.");
+            }
+            state::pause_scans_before_quit(QUIT_SAVE_LIMIT);
+            std::process::exit(128 + first);
+        });
+        if let Some(second) = signals.next() {
+            std::process::exit(128 + second);
+        }
+    });
 }
 
 /// Window chrome that has to be set up after wry has installed the webview.
