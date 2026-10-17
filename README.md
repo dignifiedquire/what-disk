@@ -15,8 +15,10 @@ interface that looks and behaves like a native Mac app.
 - **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
   location or a single folder when you want fresh numbers.
 - **Projects & Toolchains** lists the build folders of Rust (`target/`) and JavaScript
-  (`node_modules/`) projects, plus toolchain caches and versions (Cargo, rustup, kache,
-  sccache, nvm, Deno, npm, pnpm, Yarn, Bun), across all saved scans.
+  (`node_modules/`) projects, plus toolchain caches and versions across all saved scans:
+  - Rust: Cargo, rustup, kache, sccache
+  - JavaScript: nvm, Deno, npm, pnpm, Yarn, Bun
+  - Go: module cache, build cache, golangci-lint, SDKs in `~/sdk`
 - **Apps** lists applications and Homebrew packages with the space they and their data in
   `~/Library` use, and can uninstall them.
 

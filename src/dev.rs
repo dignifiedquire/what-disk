@@ -11,13 +11,26 @@ use crate::tree::{NodeId, ROOT, Tree, flags};
 pub enum Language {
     Rust,
     JavaScript,
+    Go,
 }
 
 impl Language {
+    pub const ALL: &[Language] = &[Language::Rust, Language::JavaScript, Language::Go];
+
     pub fn label(self) -> &'static str {
         match self {
             Language::Rust => "Rust",
             Language::JavaScript => "JavaScript",
+            Language::Go => "Go",
+        }
+    }
+
+    /// Class name for the language's badge in the stylesheet.
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Language::Rust => "rust",
+            Language::JavaScript => "js",
+            Language::Go => "go",
         }
     }
 }
@@ -180,13 +193,18 @@ const GLOBAL_CACHES: &[(&str, Language, &str, &str)] = &[
     (".bun/install/cache", Language::JavaScript, "Bun cache", REDOWNLOADED),
     (".nvm/.cache", Language::JavaScript, "nvm downloads", REDOWNLOADED),
     ("Library/Caches/deno", Language::JavaScript, "Deno cache", REDOWNLOADED),
+    ("go/pkg/mod", Language::Go, "Go module cache", REDOWNLOADED),
+    ("Library/Caches/go-build", Language::Go, "Go build cache", REBUILT),
+    ("Library/Caches/golangci-lint", Language::Go, "golangci-lint cache", REBUILT),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
-/// versions tend to pile up.
-const TOOLCHAINS: &[(&str, Language, &str, &str)] = &[
-    (".rustup/toolchains", Language::Rust, "rustup toolchain", "Reinstall with rustup"),
-    (".nvm/versions/node", Language::JavaScript, "Node.js", "Reinstall with nvm"),
+/// versions tend to pile up. Only subfolders whose name starts with the given prefix count.
+const TOOLCHAINS: &[(&str, Language, &str, &str, &str)] = &[
+    (".rustup/toolchains", Language::Rust, "rustup toolchain", "Reinstall with rustup", ""),
+    (".nvm/versions/node", Language::JavaScript, "Node.js", "Reinstall with nvm", ""),
+    // golang.org/dl installs SDKs as ~/sdk/go1.22.0; other tools use ~/sdk too.
+    ("sdk", Language::Go, "Go SDK", "Reinstall with golang.org/dl", "go"),
 ];
 
 /// Global caches and installed toolchain versions of the user whose home folder is `home`,
@@ -200,9 +218,12 @@ pub fn find_global_caches(tree: &Tree, home: &Path) -> Vec<GlobalCache> {
             Some(GlobalCache { id, language, label: label.into(), note })
         })
         .collect();
-    for &(rel, language, label, note) in TOOLCHAINS {
+    for &(rel, language, label, note, prefix) in TOOLCHAINS {
         if let Some(parent) = tree.find(&home.join(rel)) {
-            out.extend(tree.children(parent).filter(|&c| tree.node(c).is_dir()).map(|id| {
+            let versions = tree.children(parent).filter(|&c| {
+                tree.node(c).is_dir() && tree.name(c).as_bytes().starts_with(prefix.as_bytes())
+            });
+            out.extend(versions.map(|id| {
                 GlobalCache {
                     id,
                     language,
@@ -370,6 +391,33 @@ mod tests {
         assert_eq!(label(kache), Some(("kache", Language::Rust)));
         assert_eq!(label(v23), Some(("Node.js v23.3.0", Language::JavaScript)));
         assert_eq!(label(nightly), Some(("rustup toolchain nightly-2024-01-01-aarch64-apple-darwin", Language::Rust)));
+    }
+
+    #[test]
+    fn go_caches_and_sdks_are_listed() {
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let go = dir(&mut t, ROOT, "go");
+        let pkg = dir(&mut t, go, "pkg");
+        let modcache = dir(&mut t, pkg, "mod");
+        let library = dir(&mut t, ROOT, "Library");
+        let caches = dir(&mut t, library, "Caches");
+        let build = dir(&mut t, caches, "go-build");
+        let sdk = dir(&mut t, ROOT, "sdk");
+        let go122 = dir(&mut t, sdk, "go1.22.0");
+        // Another tool's SDK in the same folder must not be listed as Go.
+        dir(&mut t, sdk, "flutter");
+
+        let caches = find_global_caches(&t, Path::new("/Users/me"));
+        let go_caches: Vec<(NodeId, &str)> = caches
+            .iter()
+            .filter(|c| c.language == Language::Go)
+            .map(|c| (c.id, c.label.as_str()))
+            .collect();
+        assert_eq!(
+            go_caches,
+            vec![(modcache, "Go module cache"), (build, "Go build cache"), (go122, "Go SDK go1.22.0")]
+        );
+        assert_eq!(caches.len(), 3);
     }
 
     #[test]

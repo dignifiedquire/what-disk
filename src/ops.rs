@@ -22,11 +22,37 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
 
 /// Deletes `path` permanently. Symbolic links are removed, never followed.
 pub fn delete_now(path: &Path) -> io::Result<()> {
-    if std::fs::symlink_metadata(path)?.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        return std::fs::remove_file(path);
     }
+    match std::fs::remove_dir_all(path) {
+        // Go's module cache, among others, is read-only on purpose. Its owner may still delete
+        // it once the folders are writable again.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            make_folders_writable(path)?;
+            std::fs::remove_dir_all(path)
+        }
+        result => result,
+    }
+}
+
+/// Gives the owner write access to `path` and every folder below it, without following
+/// symbolic links.
+fn make_folders_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut permissions = std::fs::symlink_metadata(&dir)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        std::fs::set_permissions(&dir, permissions)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spawn_quiet(cmd: &mut Command) {
@@ -129,6 +155,22 @@ mod tests {
         delete_now(&tmp.path().join("doomed")).unwrap();
         assert!(!link.exists() && !tmp.path().join("doomed").exists());
         assert!(keep.join("precious").exists());
+    }
+
+    #[test]
+    fn delete_now_removes_read_only_folders_of_the_user() {
+        // Go makes its module cache read-only; "Delete Immediately" must still work on it.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("mod");
+        let module = cache.join("example.com/lib@v1.0.0");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("lib.go"), b"package lib").unwrap();
+        for dir in [&module, &module.parent().unwrap().to_path_buf(), &cache] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        delete_now(&cache).unwrap();
+        assert!(!cache.exists());
     }
 
     #[test]

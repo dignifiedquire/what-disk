@@ -242,10 +242,7 @@ fn DevItem(row: DevRow, checked: bool) -> Element {
     };
     let mut toggle_row = toggle.clone();
     let mut toggle_box = toggle;
-    let badge = match row.language {
-        Language::Rust => "badge rust",
-        Language::JavaScript => "badge js",
-    };
+    let badge = format!("badge {}", row.language.css_class());
     let size_class = match row.size {
         s if s >= 10_000_000_000 => "size huge",
         s if s >= 1_000_000_000 => "size large",
@@ -320,8 +317,9 @@ pub fn DevToolbar() -> Element {
                 ondoubleclick: move |e| e.stop_propagation(),
                 div { class: "segmented",
                     {segment("All", None)}
-                    {segment("Rust", Some(Language::Rust))}
-                    {segment("JavaScript", Some(Language::JavaScript))}
+                    for &language in Language::ALL {
+                        {segment(language.label(), Some(language))}
+                    }
                 }
             }
             div { class: "toolbar-title",
