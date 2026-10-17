@@ -993,6 +993,11 @@ input:focus-visible,
   background: rgba(0, 173, 216, 0.14);
 }
 
+.badge.java {
+  color: #9a5f0e;
+  background: rgba(176, 114, 25, 0.16);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.rust {
     color: #ff8a50;
@@ -1007,6 +1012,11 @@ input:focus-visible,
   .badge.go {
     color: #5dc9e2;
     background: rgba(0, 173, 216, 0.16);
+  }
+
+  .badge.java {
+    color: #e8a33b;
+    background: rgba(232, 163, 59, 0.16);
   }
 }
 

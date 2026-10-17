@@ -14,11 +14,13 @@ interface that looks and behaves like a native Mac app.
   Items go to the Trash, or are deleted immediately after a confirmation.
 - **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
   location or a single folder when you want fresh numbers.
-- **Projects & Toolchains** lists the build folders of Rust (`target/`) and JavaScript
-  (`node_modules/`) projects, plus toolchain caches and versions across all saved scans:
+- **Projects & Toolchains** lists the build folders of Rust (`target/`), JavaScript
+  (`node_modules/`) and Java (Maven `target/`, Gradle `build/` and `.gradle/`) projects,
+  plus toolchain caches and versions across all saved scans:
   - Rust: Cargo, rustup, kache, sccache
   - JavaScript: nvm, Deno, npm, pnpm, Yarn, Bun
   - Go: module cache, build cache, golangci-lint, SDKs in `~/sdk`
+  - Java: Maven repository, Gradle caches and distributions, JDKs
 - **Apps** lists applications and Homebrew packages with the space they and their data in
   `~/Library` use, and can uninstall them.
 

@@ -99,8 +99,8 @@ fn age(row: &DevRow) -> String {
     }
     let when = format::ago(UNIX_EPOCH + Duration::from_secs(u64::from(row.newest)));
     match row.kind {
-        Some(ArtifactKind::CargoTarget) => format!("built {when}"),
         Some(ArtifactKind::NodeModules) => format!("installed {when}"),
+        Some(_) => format!("built {when}"),
         None => format!("changed {when}"),
     }
 }

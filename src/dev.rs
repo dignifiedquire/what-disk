@@ -12,16 +12,18 @@ pub enum Language {
     Rust,
     JavaScript,
     Go,
+    Java,
 }
 
 impl Language {
-    pub const ALL: &[Language] = &[Language::Rust, Language::JavaScript, Language::Go];
+    pub const ALL: &[Language] = &[Language::Rust, Language::JavaScript, Language::Go, Language::Java];
 
     pub fn label(self) -> &'static str {
         match self {
             Language::Rust => "Rust",
             Language::JavaScript => "JavaScript",
             Language::Go => "Go",
+            Language::Java => "Java",
         }
     }
 
@@ -31,6 +33,7 @@ impl Language {
             Language::Rust => "rust",
             Language::JavaScript => "js",
             Language::Go => "go",
+            Language::Java => "java",
         }
     }
 }
@@ -42,6 +45,12 @@ pub enum ArtifactKind {
     CargoTarget,
     /// npm, pnpm, yarn or bun `node_modules/`.
     NodeModules,
+    /// Maven's `target/`.
+    MavenTarget,
+    /// Gradle's `build/`.
+    GradleBuild,
+    /// Gradle's per-project `.gradle/` cache.
+    GradleProjectCache,
 }
 
 impl ArtifactKind {
@@ -49,6 +58,9 @@ impl ArtifactKind {
         match self {
             ArtifactKind::CargoTarget => Language::Rust,
             ArtifactKind::NodeModules => Language::JavaScript,
+            ArtifactKind::MavenTarget | ArtifactKind::GradleBuild | ArtifactKind::GradleProjectCache => {
+                Language::Java
+            }
         }
     }
 
@@ -56,6 +68,9 @@ impl ArtifactKind {
         match self {
             ArtifactKind::CargoTarget => "target",
             ArtifactKind::NodeModules => "node_modules",
+            ArtifactKind::MavenTarget => "target",
+            ArtifactKind::GradleBuild => "build",
+            ArtifactKind::GradleProjectCache => ".gradle",
         }
     }
 }
@@ -93,7 +108,8 @@ const SYSTEM_FOLDERS: &[&str] = &[
 ///
 /// A Rust project is a folder with a `target/` next to `Cargo.toml`, or a `target/` that
 /// Cargo tagged with `CACHEDIR.TAG`. A JavaScript project is a folder with `node_modules/`
-/// next to `package.json`. Packages, hidden folders, `~/Library` and system folders are not
+/// next to `package.json`. A Java project has Maven's `target/` next to `pom.xml`, or
+/// Gradle's `build/` and `.gradle/` next to a Gradle build or settings file. Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
 pub fn find_projects(tree: &Tree) -> Vec<Project> {
@@ -101,29 +117,38 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
     let mut out = Vec::new();
     let mut stack = vec![ROOT];
     while let Some(dir) = stack.pop() {
-        let (mut cargo_toml, mut package_json) = (false, false);
-        let (mut target, mut node_modules) = (None, None);
+        let (mut cargo_toml, mut package_json, mut pom_xml) = (false, false, false);
+        let (mut gradle_build, mut gradle_settings) = (false, false);
+        let (mut target, mut node_modules, mut build, mut dot_gradle) = (None, None, None, None);
         for c in tree.children(dir) {
             let is_dir = tree.node(c).is_dir();
             match tree.name(c).as_bytes() {
                 b"Cargo.toml" if !is_dir => cargo_toml = true,
                 b"package.json" if !is_dir => package_json = true,
+                b"pom.xml" if !is_dir => pom_xml = true,
+                b"build.gradle" | b"build.gradle.kts" if !is_dir => gradle_build = true,
+                b"settings.gradle" | b"settings.gradle.kts" if !is_dir => gradle_settings = true,
                 b"target" if is_dir => target = Some(c),
                 b"node_modules" if is_dir => node_modules = Some(c),
+                b"build" if is_dir => build = Some(c),
+                b".gradle" if is_dir => dot_gradle = Some(c),
                 _ => {}
             }
         }
         let mut artifacts = Vec::new();
-        if let Some(t) = target
-            && (cargo_toml || has_child(tree, t, b"CACHEDIR.TAG"))
-        {
-            artifacts.push(Artifact { id: t, kind: ArtifactKind::CargoTarget });
-        }
-        if let Some(m) = node_modules
-            && package_json
-        {
-            artifacts.push(Artifact { id: m, kind: ArtifactKind::NodeModules });
-        }
+        let mut found = |id: Option<NodeId>, kind: ArtifactKind, condition: bool| {
+            if let Some(id) = id
+                && condition
+            {
+                artifacts.push(Artifact { id, kind });
+            }
+        };
+        let cargo = cargo_toml || target.is_some_and(|t| has_child(tree, t, b"CACHEDIR.TAG"));
+        found(target, ArtifactKind::CargoTarget, cargo);
+        found(target, ArtifactKind::MavenTarget, !cargo && pom_xml);
+        found(node_modules, ArtifactKind::NodeModules, package_json);
+        found(build, ArtifactKind::GradleBuild, gradle_build);
+        found(dot_gradle, ArtifactKind::GradleProjectCache, gradle_build || gradle_settings);
         for c in tree.children(dir) {
             let n = tree.node(c);
             let searchable = n.is_dir()
@@ -196,6 +221,8 @@ const GLOBAL_CACHES: &[(&str, Language, &str, &str)] = &[
     ("go/pkg/mod", Language::Go, "Go module cache", REDOWNLOADED),
     ("Library/Caches/go-build", Language::Go, "Go build cache", REBUILT),
     ("Library/Caches/golangci-lint", Language::Go, "golangci-lint cache", REBUILT),
+    (".m2/repository", Language::Java, "Maven repository", REDOWNLOADED),
+    (".gradle/caches", Language::Java, "Gradle caches", REDOWNLOADED),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
@@ -205,6 +232,17 @@ const TOOLCHAINS: &[(&str, Language, &str, &str, &str)] = &[
     (".nvm/versions/node", Language::JavaScript, "Node.js", "Reinstall with nvm", ""),
     // golang.org/dl installs SDKs as ~/sdk/go1.22.0; other tools use ~/sdk too.
     ("sdk", Language::Go, "Go SDK", "Reinstall with golang.org/dl", "go"),
+    (".gradle/wrapper/dists", Language::Java, "Gradle", "Downloaded again by the Gradle wrapper", ""),
+    (".sdkman/candidates/java", Language::Java, "JDK", "Reinstall with sdk install java", ""),
+    ("Library/Java/JavaVirtualMachines", Language::Java, "JDK", "Reinstall the JDK", ""),
+    // An absolute path stays absolute when joined to the home folder.
+    (
+        "/Library/Java/JavaVirtualMachines",
+        Language::Java,
+        "JDK",
+        "Reinstall the JDK; removing it needs an administrator",
+        "",
+    ),
 ];
 
 /// Global caches and installed toolchain versions of the user whose home folder is `home`,
@@ -418,6 +456,76 @@ mod tests {
             vec![(modcache, "Go module cache"), (build, "Go build cache"), (go122, "Go SDK go1.22.0")]
         );
         assert_eq!(caches.len(), 3);
+    }
+
+    #[test]
+    fn java_build_folders_need_their_build_file_next_to_them() {
+        // "target" and "build" are common names; only Maven's and Gradle's own are offered,
+        // and a Rust target is never mistaken for Maven's.
+        let mut t = Tree::new("/w".into(), "w", 0);
+        let maven = dir(&mut t, ROOT, "maven");
+        file(&mut t, maven, "pom.xml", 1, 0);
+        dir(&mut t, maven, "target");
+        let gradle = dir(&mut t, ROOT, "gradle");
+        file(&mut t, gradle, "build.gradle.kts", 1, 0);
+        dir(&mut t, gradle, "build");
+        t.add(gradle, b".gradle", Kind::Dir, flags::HIDDEN, 0, 0);
+        let app = dir(&mut t, gradle, "app");
+        file(&mut t, app, "build.gradle", 1, 0);
+        dir(&mut t, app, "build");
+        let settings_only = dir(&mut t, ROOT, "settings-only");
+        file(&mut t, settings_only, "settings.gradle", 1, 0);
+        t.add(settings_only, b".gradle", Kind::Dir, flags::HIDDEN, 0, 0);
+        let site = dir(&mut t, ROOT, "site");
+        dir(&mut t, site, "build");
+        let both = dir(&mut t, ROOT, "both");
+        file(&mut t, both, "Cargo.toml", 1, 0);
+        file(&mut t, both, "pom.xml", 1, 0);
+        dir(&mut t, both, "target");
+        assert_eq!(
+            found(&t),
+            vec![
+                ("/w/both".into(), vec![ArtifactKind::CargoTarget]),
+                ("/w/gradle".into(), vec![ArtifactKind::GradleBuild, ArtifactKind::GradleProjectCache]),
+                ("/w/gradle/app".into(), vec![ArtifactKind::GradleBuild]),
+                ("/w/maven".into(), vec![ArtifactKind::MavenTarget]),
+                ("/w/settings-only".into(), vec![ArtifactKind::GradleProjectCache]),
+            ]
+        );
+    }
+
+    #[test]
+    fn java_caches_and_each_jdk_and_gradle_version_are_listed() {
+        let mut t = Tree::new("/".into(), "Macintosh HD", 0);
+        let library = dir(&mut t, ROOT, "Library");
+        let java = dir(&mut t, library, "Java");
+        let jvms = dir(&mut t, java, "JavaVirtualMachines");
+        let temurin = dir(&mut t, jvms, "temurin-17.jdk");
+        let users = dir(&mut t, ROOT, "Users");
+        let me = dir(&mut t, users, "me");
+        let m2 = t.add(me, b".m2", Kind::Dir, flags::HIDDEN, 0, 0);
+        let repo = dir(&mut t, m2, "repository");
+        let gradle = t.add(me, b".gradle", Kind::Dir, flags::HIDDEN, 0, 0);
+        let caches = dir(&mut t, gradle, "caches");
+        let wrapper = dir(&mut t, gradle, "wrapper");
+        let dists = dir(&mut t, wrapper, "dists");
+        let g85 = dir(&mut t, dists, "gradle-8.5-bin");
+
+        let found = find_global_caches(&t, Path::new("/Users/me"));
+        let mut java: Vec<(NodeId, String)> = found
+            .iter()
+            .filter(|c| c.language == Language::Java)
+            .map(|c| (c.id, c.label.clone()))
+            .collect();
+        java.sort();
+        let mut expected = vec![
+            (temurin, "JDK temurin-17.jdk".to_string()),
+            (repo, "Maven repository".to_string()),
+            (caches, "Gradle caches".to_string()),
+            (g85, "Gradle gradle-8.5-bin".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(java, expected);
     }
 
     #[test]
