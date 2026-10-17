@@ -124,7 +124,7 @@ pub fn Browser(session: SessionRef, root: NodeId) -> Element {
             if needs_fda {
                 div { class: "banner",
                     Symbol { icon: Icon::Lock }
-                    span { "Without Full Disk Access some folders are skipped and their space shows as unaccounted." }
+                    span { class: "banner-text", "Without Full Disk Access some folders are skipped and their space shows as unaccounted." }
                     button { class: "btn small", onclick: |_| ops::open_full_disk_access_settings(), "Open Settings…" }
                     button {
                         class: "btn small plain",

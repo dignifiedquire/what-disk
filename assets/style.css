@@ -428,7 +428,7 @@ input:focus-visible,
   border-bottom: 0.5px solid var(--separator);
 }
 
-.banner span {
+.banner-text {
   flex: 1;
 }
 

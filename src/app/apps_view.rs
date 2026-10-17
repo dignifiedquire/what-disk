@@ -93,18 +93,12 @@ impl AppEntry {
     }
 }
 
-/// Locations the report could not see because no scan covers them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Missing {
-    Applications,
-    Library,
-    Homebrew,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppsReport {
     pub entries: Vec<AppEntry>,
-    pub missing: Vec<Missing>,
+    /// Folders the report needs that no scan covers yet. Scanning just these is enough;
+    /// the whole disk is not needed.
+    pub missing: Vec<PathBuf>,
 }
 
 /// Loaded scans, newest first, for looking up sizes by path.
@@ -158,9 +152,6 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
     let scans = Scans::new(sessions);
     let library = home.join("Library");
     let mut report = AppsReport::default();
-    if !scans.covers(&library) {
-        report.missing.push(Missing::Library);
-    }
 
     // Apps installed by a cask are listed with the cask.
     let cask_apps: HashSet<PathBuf> = brew
@@ -173,10 +164,14 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
         (PathBuf::from("/Applications"), Group::Global),
         (home.join("Applications"), Group::User),
     ] {
-        let Some((session, _)) = scans.locate(&folder) else {
-            if group == Group::Global {
-                report.missing.push(Missing::Applications);
+        if !scans.covers(&folder) {
+            // ~/Applications is optional; only ask to scan it when it exists.
+            if group == Group::Global || folder.exists() {
+                report.missing.push(folder);
             }
+            continue;
+        }
+        let Some((session, _)) = scans.locate(&folder) else {
             continue;
         };
         let found: Vec<(PathBuf, u64)> = {
@@ -198,9 +193,12 @@ pub fn collect(sessions: Vec<Arc<Session>>, home: &Path, brew: Option<&Brew>) ->
         }
     }
 
+    if !scans.covers(&library) {
+        report.missing.push(library.clone());
+    }
     if let Some(brew) = brew {
         if !scans.covers(&brew.prefix) {
-            report.missing.push(Missing::Homebrew);
+            report.missing.push(brew.prefix.clone());
         }
         for cask in &brew.casks {
             let apps: Vec<PathBuf> = cask.apps.iter().map(|a| Path::new("/Applications").join(a)).collect();
@@ -373,6 +371,7 @@ pub fn AppsView() -> Element {
     let selected: Vec<AppEntry> = entries.iter().filter(|e| checked.contains(&e.key)).cloned().collect();
     let selected_size: u64 = selected.iter().map(AppEntry::total).sum();
     let missing = report.as_ref().map_or_else(Vec::new, |r| r.missing.clone());
+    let scanning = state.sessions.read().values().any(|s| s.busy() == Busy::Scanning);
     let groups = [Group::Global, Group::User, Group::Casks, Group::Formulae, Group::BrewCache];
     let segment = move |label: &'static str, value: Filter| {
         rsx! {
@@ -406,19 +405,27 @@ pub fn AppsView() -> Element {
             }
             div { class: "toolbar-title",
                 div { class: "title", "Apps" }
-                div { class: "subtitle", "{entries.len()} installed · {format::bytes(entries.iter().map(AppEntry::total).sum())}" }
+                // Nothing to count until a scan or Homebrew has reported something.
+                if !entries.is_empty() {
+                    div { class: "subtitle", "{entries.len()} installed · {format::bytes(entries.iter().map(AppEntry::total).sum())}" }
+                }
             }
         }
         div { class: "browser",
-            for m in missing {
-                MissingBanner { missing: m }
+            if scanning {
+                div { class: "banner",
+                    span { class: "spinner" }
+                    span { class: "banner-text", "Scanning… the list updates as results come in." }
+                }
+            } else if !missing.is_empty() {
+                ScanMissingBanner { roots: missing }
             }
             if let Some(note) = brew_note {
                 div { class: "banner",
                     if brew_state == BrewState::Loading {
                         span { class: "spinner" }
                     }
-                    span { "{note}" }
+                    span { class: "banner-text", "{note}" }
                 }
             }
             if report.is_none() {
@@ -469,22 +476,23 @@ pub fn AppsView() -> Element {
     }
 }
 
+/// Offers to scan only the folders the overview needs.
 #[component]
-fn MissingBanner(missing: Missing) -> Element {
+fn ScanMissingBanner(roots: Vec<PathBuf>) -> Element {
     let state = use_app_state();
-    let (text, root, button) = match missing {
-        Missing::Applications => ("Apps in /Applications are not scanned yet.", PathBuf::from("/"), "Scan Macintosh HD"),
-        Missing::Homebrew => ("Homebrew sizes need a scan of Macintosh HD.", PathBuf::from("/"), "Scan Macintosh HD"),
-        Missing::Library => ("App data in ~/Library is not scanned yet.", home_dir(), "Scan Home Folder"),
-    };
-    let busy = state.sessions.read().get(&root).is_some_and(|s| s.busy() == Busy::Scanning);
+    let names = roots.iter().map(|p| short_path(p)).collect::<Vec<_>>().join(", ");
+    let label = if roots.len() == 1 { "Scan Folder" } else { "Scan These Folders" };
     rsx! {
         div { class: "banner",
-            span { "{text}" }
-            if busy {
-                span { class: "spinner" }
-            } else {
-                button { class: "btn small", onclick: move |_| state.start_scan(&root), "{button}" }
+            span { class: "banner-text", "Not scanned yet: {names}" }
+            button {
+                class: "btn small",
+                onclick: move |_| {
+                    for root in &roots {
+                        state.start_scan(root);
+                    }
+                },
+                "{label}"
             }
         }
     }
@@ -761,7 +769,8 @@ mod tests {
     fn missing_scans_are_reported_instead_of_zero_sizes() {
         let home_only = session("/Users/me", |_| {});
         let report = collect(vec![home_only], Path::new("/Users/me"), Some(&brew()));
-        assert_eq!(report.missing, vec![Missing::Applications, Missing::Homebrew]);
+        // Only the folders needed, not the whole disk.
+        assert_eq!(report.missing, vec![PathBuf::from("/Applications"), PathBuf::from("/opt/homebrew")]);
         let zstd = report.entries.iter().find(|e| e.name == "zstd").unwrap();
         assert_eq!(zstd.install_size(), None);
     }
