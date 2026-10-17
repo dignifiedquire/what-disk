@@ -44,6 +44,17 @@ pub enum Root {
     Bazel,
     /// Bazel 8 and earlier.
     BazelLegacy,
+    PipCache,
+    UvCache,
+    UvPython,
+    PipxCache,
+    PoetryCache,
+    PipenvCache,
+    PipenvVenvs,
+    PdmCache,
+    HatchCache,
+    HatchData,
+    PyenvRoot,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -71,6 +82,11 @@ const QUERIES: &[Query] = &[
     (Root::DenoDir, "deno", &["info", "--json"], deno_dir),
     (Root::Ccache, "ccache", &["-k", "cache_dir"], first_line),
     (Root::ConanHome, "conan", &["config", "home"], first_line),
+    (Root::PipCache, "pip3", &["cache", "dir"], first_line),
+    (Root::UvCache, "uv", &["cache", "dir"], first_line),
+    (Root::UvPython, "uv", &["python", "dir"], first_line),
+    (Root::PoetryCache, "poetry", &["config", "cache-dir"], first_line),
+    (Root::PyenvRoot, "pyenv", &["root"], first_line),
 ];
 
 impl Locations {
@@ -189,6 +205,37 @@ impl Locations {
                 .unwrap_or_else(|| home("Library/Caches/bazel"))
                 .join(format!("_bazel_{}", self.user())),
             Root::BazelLegacy => PathBuf::from(format!("/private/var/tmp/_bazel_{}", self.user())),
+            // Python tools built on platformdirs honour XDG variables on macOS since 2026.
+            Root::PipCache => var("PIP_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "pip"))
+                .unwrap_or_else(|| home("Library/Caches/pip")),
+            // uv follows XDG conventions on macOS too.
+            Root::UvCache => var("UV_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "uv"))
+                .unwrap_or_else(|| home(".cache/uv")),
+            Root::UvPython => var("UV_PYTHON_INSTALL_DIR")
+                .or_else(|| self.xdg("XDG_DATA_HOME", "uv/python"))
+                .unwrap_or_else(|| home(".local/share/uv/python")),
+            Root::PipxCache => self.xdg("XDG_CACHE_HOME", "pipx").unwrap_or_else(|| home("Library/Caches/pipx")),
+            Root::PoetryCache => var("POETRY_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "pypoetry"))
+                .unwrap_or_else(|| home("Library/Caches/pypoetry")),
+            Root::PipenvCache => var("PIPENV_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "pipenv"))
+                .unwrap_or_else(|| home("Library/Caches/pipenv")),
+            Root::PipenvVenvs => var("WORKON_HOME")
+                .or_else(|| self.xdg("XDG_DATA_HOME", "virtualenvs"))
+                .unwrap_or_else(|| home(".local/share/virtualenvs")),
+            Root::PdmCache => var("PDM_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "pdm"))
+                .unwrap_or_else(|| home("Library/Caches/pdm")),
+            Root::HatchCache => var("HATCH_CACHE_DIR")
+                .or_else(|| self.xdg("XDG_CACHE_HOME", "hatch"))
+                .unwrap_or_else(|| home("Library/Caches/hatch")),
+            Root::HatchData => var("HATCH_DATA_DIR")
+                .or_else(|| self.xdg("XDG_DATA_HOME", "hatch"))
+                .unwrap_or_else(|| home("Library/Application Support/hatch")),
+            Root::PyenvRoot => var("PYENV_ROOT").unwrap_or_else(|| home(".pyenv")),
         }
     }
 

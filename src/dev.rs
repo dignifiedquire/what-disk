@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::locations::{Locations, Root};
 use crate::tree::{NodeId, ROOT, Tree, flags};
-use Language::{C, Go, Java, JavaScript as Js, Rust, Swift};
+use Language::{C, Go, Java, JavaScript as Js, Python, Rust, Swift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -17,6 +17,7 @@ pub enum Language {
     Java,
     C,
     Swift,
+    Python,
 }
 
 impl Language {
@@ -27,6 +28,7 @@ impl Language {
         Language::Java,
         Language::C,
         Language::Swift,
+        Language::Python,
     ];
 
     pub fn label(self) -> &'static str {
@@ -37,6 +39,7 @@ impl Language {
             Language::Java => "Java",
             Language::C => "C/C++",
             Language::Swift => "Swift",
+            Language::Python => "Python",
         }
     }
 
@@ -49,6 +52,7 @@ impl Language {
             Language::Java => "java",
             Language::C => "c",
             Language::Swift => "swift",
+            Language::Python => "python",
         }
     }
 }
@@ -72,6 +76,18 @@ pub enum ArtifactKind {
     MesonBuild,
     /// Swift Package Manager's `.build/`.
     SwiftPmBuild,
+    /// A Python virtual environment, whatever its name; it holds a `pyvenv.cfg`.
+    PythonVenv,
+    /// tox's `.tox/`.
+    Tox,
+    /// Nox's `.nox/`.
+    Nox,
+    /// mypy's `.mypy_cache/`.
+    MypyCache,
+    /// Ruff's `.ruff_cache/`.
+    RuffCache,
+    /// pytest's `.pytest_cache/`.
+    PytestCache,
 }
 
 impl ArtifactKind {
@@ -84,6 +100,12 @@ impl ArtifactKind {
             }
             ArtifactKind::CMakeBuild | ArtifactKind::MesonBuild => Language::C,
             ArtifactKind::SwiftPmBuild => Language::Swift,
+            ArtifactKind::PythonVenv
+            | ArtifactKind::Tox
+            | ArtifactKind::Nox
+            | ArtifactKind::MypyCache
+            | ArtifactKind::RuffCache
+            | ArtifactKind::PytestCache => Language::Python,
         }
     }
 
@@ -97,6 +119,12 @@ impl ArtifactKind {
             ArtifactKind::CMakeBuild => "CMake build",
             ArtifactKind::MesonBuild => "Meson build",
             ArtifactKind::SwiftPmBuild => ".build",
+            ArtifactKind::PythonVenv => "virtual environment",
+            ArtifactKind::Tox => ".tox",
+            ArtifactKind::Nox => ".nox",
+            ArtifactKind::MypyCache => ".mypy_cache",
+            ArtifactKind::RuffCache => ".ruff_cache",
+            ArtifactKind::PytestCache => ".pytest_cache",
         }
     }
 }
@@ -137,7 +165,9 @@ const SYSTEM_FOLDERS: &[&str] = &[
 /// next to `package.json`. A Java project has Maven's `target/` next to `pom.xml`, or
 /// Gradle's `build/` and `.gradle/` next to a Gradle build or settings file. A C or C++ build
 /// folder is recognised by what CMake or Meson leaves in it, since it can have any name. A
-/// Swift package has `.build/` next to `Package.swift`. Packages, hidden folders, `~/Library` and system folders are not
+/// Swift package has `.build/` next to `Package.swift`. A Python virtual environment is a
+/// folder with a `pyvenv.cfg`, whatever its name; tox and Nox folders sit next to their
+/// configuration, and the mypy, Ruff and pytest caches carry a `CACHEDIR.TAG`. Packages, hidden folders, `~/Library` and system folders are not
 /// searched, and neither are artifact folders themselves, so nested `node_modules` count as
 /// part of the outer one.
 pub fn find_projects(tree: &Tree) -> Vec<Project> {
@@ -151,6 +181,8 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         let (mut cmake_cache, mut cmake_lists, mut meson_private, mut meson_build) =
             (false, false, false, false);
         let (mut target, mut node_modules, mut build, mut dot_gradle) = (None, None, None, None);
+        let (mut pyvenv_cfg, mut tox_config, mut noxfile) = (false, false, false);
+        let (mut tox, mut nox, mut mypy, mut ruff, mut pytest) = (None, None, None, None, None);
         for c in tree.children(dir) {
             let is_dir = tree.node(c).is_dir();
             match tree.name(c).as_bytes() {
@@ -169,13 +201,23 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
                 b".gradle" if is_dir => dot_gradle = Some(c),
                 b"Package.swift" if !is_dir => package_swift = true,
                 b".build" if is_dir => swift_build = Some(c),
+                b"pyvenv.cfg" if !is_dir => pyvenv_cfg = true,
+                b"tox.ini" | b"tox.toml" | b"pyproject.toml" | b"setup.cfg" if !is_dir => tox_config = true,
+                b"noxfile.py" if !is_dir => noxfile = true,
+                b".tox" if is_dir => tox = Some(c),
+                b".nox" if is_dir => nox = Some(c),
+                b".mypy_cache" if is_dir => mypy = Some(c),
+                b".ruff_cache" if is_dir => ruff = Some(c),
+                b".pytest_cache" if is_dir => pytest = Some(c),
                 _ => {}
             }
         }
         // This folder is itself a C/C++ build folder of its parent. An in-source build keeps
         // its cache next to the sources, so a folder with a CMakeLists.txt or meson.build is
         // never one: offering it would offer the source code for deletion.
-        let build_kind = if cmake_cache && !cmake_lists {
+        let build_kind = if pyvenv_cfg {
+            Some(ArtifactKind::PythonVenv)
+        } else if cmake_cache && !cmake_lists {
             Some(ArtifactKind::CMakeBuild)
         } else if meson_private && !meson_build {
             Some(ArtifactKind::MesonBuild)
@@ -204,6 +246,23 @@ pub fn find_projects(tree: &Tree) -> Vec<Project> {
         found(build, ArtifactKind::GradleBuild, gradle_build);
         found(dot_gradle, ArtifactKind::GradleProjectCache, gradle_build || gradle_settings);
         found(swift_build, ArtifactKind::SwiftPmBuild, package_swift);
+        found(tox, ArtifactKind::Tox, tox_config);
+        found(nox, ArtifactKind::Nox, noxfile);
+        let tagged = |id: Option<NodeId>| id.is_some_and(|d| has_child(tree, d, b"CACHEDIR.TAG"));
+        found(mypy, ArtifactKind::MypyCache, tagged(mypy));
+        found(ruff, ArtifactKind::RuffCache, tagged(ruff));
+        found(pytest, ArtifactKind::PytestCache, tagged(pytest));
+        // Hidden folders are not searched, so a `.venv` is recognised from here.
+        for c in tree.children(dir) {
+            let n = tree.node(c);
+            if n.is_dir()
+                && n.has(flags::HIDDEN)
+                && !artifacts.iter().any(|a| a.id == c)
+                && has_child(tree, c, b"pyvenv.cfg")
+            {
+                artifacts.push(Artifact { id: c, kind: ArtifactKind::PythonVenv });
+            }
+        }
         for c in tree.children(dir) {
             let n = tree.node(c);
             let searchable = n.is_dir()
@@ -296,6 +355,16 @@ const GLOBAL_CACHES: &[(Root, &str, Language, &str, &str)] = &[
     (Root::Home, "Library/Developer/CoreSimulator/Caches", Swift, "Simulator caches", REBUILT),
     (Root::Home, "Library/Developer/Xcode/UserData/Previews", Swift, "SwiftUI previews", REBUILT),
     (Root::Home, "Library/Caches/com.apple.dt.Xcode", Swift, "Xcode cache", REBUILT),
+    (Root::PipCache, "", Python, "pip cache", REDOWNLOADED),
+    (Root::UvCache, "", Python, "uv cache", REDOWNLOADED),
+    (Root::PipxCache, "", Python, "pipx cache", REDOWNLOADED),
+    // Not the whole Poetry cache folder: it also holds Poetry's environments, listed below.
+    (Root::PoetryCache, "cache", Python, "Poetry cache", REDOWNLOADED),
+    (Root::PoetryCache, "artifacts", Python, "Poetry artifacts", REDOWNLOADED),
+    (Root::PipenvCache, "", Python, "Pipenv cache", REDOWNLOADED),
+    (Root::PdmCache, "", Python, "PDM cache", REDOWNLOADED),
+    (Root::HatchCache, "", Python, "Hatch cache", REDOWNLOADED),
+    (Root::PyenvRoot, "cache", Python, "pyenv downloads", REDOWNLOADED),
 ];
 
 /// Folders whose subfolders are installed toolchain versions, listed one by one since old
@@ -327,6 +396,12 @@ const TOOLCHAINS: &[(Root, &str, Language, &str, &str, &str)] = &[
     (Root::Home, "Library/Developer/Xcode/tvOS DeviceSupport", Swift, "tvOS device support", DEVICE_SUPPORT, ""),
     // swift.org installers and swiftly both install here on macOS.
     (Root::Home, "Library/Developer/Toolchains", Swift, "Swift toolchain", "Reinstall with swiftly or from swift.org", ""),
+    (Root::UvPython, "", Python, "Python (uv)", "Reinstall with uv python install", "cpython"),
+    (Root::UvPython, "", Python, "Python (uv)", "Reinstall with uv python install", "pypy"),
+    (Root::PyenvRoot, "versions", Python, "Python (pyenv)", "Reinstall with pyenv install", ""),
+    (Root::PoetryCache, "virtualenvs", Python, "Poetry environment", "Recreated by poetry install", ""),
+    (Root::PipenvVenvs, "", Python, "Pipenv environment", "Recreated by pipenv install", ""),
+    (Root::HatchData, "env/virtual", Python, "Hatch environments", "Recreated by Hatch", ""),
 ];
 
 /// "MyApp-abcdefghijklmnopqrstuvwxyzab" -> "MyApp": Xcode appends 28 random letters to the
@@ -361,7 +436,8 @@ pub fn find_global_caches(tree: &Tree, locations: &Locations) -> Vec<GlobalCache
             continue;
         };
         let versions = tree.children(parent).filter(|&c| {
-            tree.node(c).is_dir() && tree.name(c).as_bytes().starts_with(prefix.as_bytes())
+            let n = tree.node(c);
+            n.is_dir() && !n.has(flags::HIDDEN) && tree.name(c).as_bytes().starts_with(prefix.as_bytes())
         });
         for id in versions {
             let name = without_xcode_suffix(&tree.display_name(id)).to_string();
@@ -728,6 +804,90 @@ mod tests {
         assert_eq!(without_xcode_suffix("nightly-2024-01-01-aarch64-apple-darwin"), "nightly-2024-01-01-aarch64-apple-darwin");
         assert_eq!(without_xcode_suffix("App-ABCDEFGHIJKLMNOPQRSTUVWXYZAB"), "App-ABCDEFGHIJKLMNOPQRSTUVWXYZAB");
         assert_eq!(without_xcode_suffix("-abcdefghijklmnopqrstuvwxyzab"), "-abcdefghijklmnopqrstuvwxyzab");
+    }
+
+    #[test]
+    fn python_environments_are_recognised_by_their_pyvenv_cfg() {
+        // "env" and "venv" are common names for unrelated folders; only a real virtual
+        // environment may be offered, and a Pipenv `.venv` pointer file is not a folder.
+        let mut t = Tree::new("/w".into(), "w", 0);
+        let app = dir(&mut t, ROOT, "app");
+        file(&mut t, app, "pyproject.toml", 1, 0);
+        let venv = t.add(app, b".venv", Kind::Dir, flags::HIDDEN, 0, 0);
+        file(&mut t, venv, "pyvenv.cfg", 1, 0);
+        let tox = t.add(app, b".tox", Kind::Dir, flags::HIDDEN, 0, 0);
+        let py312 = dir(&mut t, tox, "py312");
+        file(&mut t, py312, "pyvenv.cfg", 1, 0);
+        let mypy = t.add(app, b".mypy_cache", Kind::Dir, flags::HIDDEN, 0, 0);
+        file(&mut t, mypy, "CACHEDIR.TAG", 1, 0);
+        t.add(app, b".ruff_cache", Kind::Dir, flags::HIDDEN, 0, 0);
+        let tool = dir(&mut t, ROOT, "tool");
+        let env = dir(&mut t, tool, "env");
+        file(&mut t, env, "pyvenv.cfg", 1, 0);
+        let config = dir(&mut t, ROOT, "config");
+        dir(&mut t, config, "env");
+        let pipenv = dir(&mut t, ROOT, "pipenv-project");
+        t.add(pipenv, b".venv", Kind::File, flags::HIDDEN, 1, 0);
+        let nox = dir(&mut t, ROOT, "nox-project");
+        file(&mut t, nox, "noxfile.py", 1, 0);
+        t.add(nox, b".nox", Kind::Dir, flags::HIDDEN, 0, 0);
+
+        let mut kinds: Vec<(PathBuf, ArtifactKind)> = find_projects(&t)
+            .into_iter()
+            .flat_map(|p| p.artifacts.into_iter().map(|a| (t.path(a.id), a.kind)).collect::<Vec<_>>())
+            .collect();
+        kinds.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kinds,
+            vec![
+                ("/w/app/.mypy_cache".into(), ArtifactKind::MypyCache),
+                ("/w/app/.tox".into(), ArtifactKind::Tox),
+                ("/w/app/.venv".into(), ArtifactKind::PythonVenv),
+                ("/w/nox-project/.nox".into(), ArtifactKind::Nox),
+                ("/w/tool/env".into(), ArtifactKind::PythonVenv),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_caches_interpreters_and_environments_are_listed() {
+        let mut t = Tree::new("/Users/me".into(), "me", 0);
+        let library = dir(&mut t, ROOT, "Library");
+        let caches = dir(&mut t, library, "Caches");
+        let pip = dir(&mut t, caches, "pip");
+        let poetry = dir(&mut t, caches, "pypoetry");
+        let poetry_cache = dir(&mut t, poetry, "cache");
+        let poetry_envs = dir(&mut t, poetry, "virtualenvs");
+        let poetry_env = dir(&mut t, poetry_envs, "app-AbCd-py3.12");
+        let dot_cache = t.add(ROOT, b".cache", Kind::Dir, flags::HIDDEN, 0, 0);
+        let uv = dir(&mut t, dot_cache, "uv");
+        let local = t.add(ROOT, b".local", Kind::Dir, flags::HIDDEN, 0, 0);
+        let share = dir(&mut t, local, "share");
+        let uv_data = dir(&mut t, share, "uv");
+        let pythons = dir(&mut t, uv_data, "python");
+        let cpython = dir(&mut t, pythons, "cpython-3.12.4-macos-aarch64-none");
+        t.add(pythons, b".cache", Kind::Dir, flags::HIDDEN, 0, 0);
+        let pyenv = t.add(ROOT, b".pyenv", Kind::Dir, flags::HIDDEN, 0, 0);
+        let versions = dir(&mut t, pyenv, "versions");
+        let v311 = dir(&mut t, versions, "3.11.9");
+
+        let mut found: Vec<(NodeId, String)> =
+            find_global_caches(&t, &Locations::defaults(Path::new("/Users/me")))
+                .into_iter()
+                .filter(|c| c.language == Language::Python)
+                .map(|c| (c.id, c.label))
+                .collect();
+        found.sort();
+        let mut expected = vec![
+            (pip, "pip cache".to_string()),
+            (poetry_cache, "Poetry cache".to_string()),
+            (uv, "uv cache".to_string()),
+            (cpython, "Python (uv) cpython-3.12.4-macos-aarch64-none".to_string()),
+            (v311, "Python (pyenv) 3.11.9".to_string()),
+            (poetry_env, "Poetry environment app-AbCd-py3.12".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]

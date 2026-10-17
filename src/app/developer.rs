@@ -51,13 +51,20 @@ pub fn collect(mut sessions: Vec<Arc<Session>>, locations: &Locations) -> Vec<De
             let title = tree.display_name(project.dir).into_owned();
             for a in project.artifacts {
                 let path = tree.path(a.id);
+                // The folder's own name, with what it is when the name does not say.
+                let name = tree.display_name(a.id);
+                let what = if name == a.kind.folder_name() {
+                    name.into_owned()
+                } else {
+                    format!("{name} · {}", a.kind.folder_name())
+                };
                 if seen.insert(path.clone()) {
                     rows.push(DevRow {
                         path,
                         title: title.clone(),
                         location: location.clone(),
                         language: a.kind.language(),
-                        what: a.kind.folder_name().into(),
+                        what,
                         kind: Some(a.kind),
                         size: tree.size(a.id),
                         newest: dev::newest_mtime(&tree, a.id),

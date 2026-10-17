@@ -1008,6 +1008,11 @@ input:focus-visible,
   background: rgba(240, 81, 56, 0.14);
 }
 
+.badge.python {
+  color: #6a3fb8;
+  background: rgba(122, 79, 201, 0.14);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.rust {
     color: #ff8a50;
@@ -1037,6 +1042,11 @@ input:focus-visible,
   .badge.swift {
     color: #ff7a5c;
     background: rgba(255, 122, 92, 0.16);
+  }
+
+  .badge.python {
+    color: #b79bff;
+    background: rgba(183, 155, 255, 0.16);
   }
 }
 
