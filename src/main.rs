@@ -6,6 +6,9 @@ mod dev;
 mod locations;
 mod ops;
 mod scan;
+// Not used by the app yet: the scanner and views move to it in the next steps.
+#[allow(dead_code)]
+mod store;
 mod temp;
 mod tree;
 mod volumes;
