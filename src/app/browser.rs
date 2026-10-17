@@ -564,11 +564,16 @@ pub fn show_context_menu(mut state: AppState, path: PathBuf) {
             None => menu.append(&PredefinedMenuItem::separator()),
         };
     }
-    let window = dioxus::desktop::window();
-    // SAFETY: the view belongs to this window, which outlives the synchronous menu loop.
-    unsafe {
-        menu.show_context_menu_for_nsview(window.window.ns_view() as *const _, None);
-    }
+    // The menu runs its own event loop until it closes. Opened inside the event handler, that
+    // loop let the page re-render while dioxus was still dispatching the event, which panics
+    // ("RefCell already borrowed"). Opened from a task, rendering waits until it closes.
+    spawn(async move {
+        let window = dioxus::desktop::window();
+        // SAFETY: the view belongs to this window, which outlives the synchronous menu loop.
+        unsafe {
+            menu.show_context_menu_for_nsview(window.window.ns_view() as *const _, None);
+        }
+    });
 }
 
 pub fn context_action(state: AppState, action: &str) {
