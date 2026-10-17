@@ -1,6 +1,6 @@
 //! The scanned view: column browser or item list on the left, sunburst on the right.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dioxus::desktop::muda::{ContextMenu, Menu, MenuItem, PredefinedMenuItem};
@@ -9,7 +9,9 @@ use dioxus::prelude::*;
 
 use super::icons::{Icon, Symbol};
 use super::remove::BottomBar;
-use super::state::{AppState, Busy, Mode, is_protected, use_app_state};
+use super::state::{
+    AppState, Busy, Mode, Overview, home_dir, is_protected, use_app_state, use_list_trigger,
+};
 use super::sunburst::Sunburst;
 use super::{SessionRef, format, icon_url};
 use crate::ops;
@@ -308,8 +310,9 @@ fn handle_key(mut state: AppState, session: &SessionRef, root: NodeId, e: Keyboa
             if let Some(&s) = selection.last()
                 && !is_protected(&tree, s)
             {
+                let path = tree.path(s);
                 drop(tree);
-                trash_one(state, session.0.clone(), s);
+                trash_one(state, path);
             }
             return;
         }
@@ -331,6 +334,7 @@ fn ItemRow(
 ) -> Element {
     let mut state = use_app_state();
     let id = row.id;
+    let path = row.path.clone();
     let mut class = String::from("row");
     if selected {
         class.push_str(if focused { " focused" } else { " selected" });
@@ -345,7 +349,7 @@ fn ItemRow(
             oncontextmenu: move |e| {
                 e.prevent_default();
                 onselect.call(id);
-                show_context_menu(state, id);
+                show_context_menu(state, path.clone());
             },
             input {
                 r#type: "checkbox",
@@ -380,15 +384,13 @@ fn ItemRow(
 #[component]
 fn ItemList(session: SessionRef, root: NodeId, kind: ListKind) -> Element {
     let mut state = use_app_state();
-    // While a scan is running the tree changes four times a second; walking millions of
-    // nodes that often would stall the UI, so recompute at most every two seconds.
-    let bucket = use_memo(move || (state.rev)() / 8);
+    let trigger = use_list_trigger(state);
     let mut ids = use_signal(Vec::<NodeId>::new);
     let mut computing = use_signal(|| true);
     let job_session = session.clone();
     let job_kind = kind.clone();
     use_resource(move || {
-        let _ = bucket();
+        let _ = trigger();
         let session = job_session.0.clone();
         let kind = job_kind.clone();
         async move {
@@ -489,17 +491,55 @@ fn PathBar(session: SessionRef, root: NodeId, root_name: String, selection: Vec<
     }
 }
 
-fn show_context_menu(mut state: AppState, id: NodeId) {
-    let Some((session, _)) = state.resolve(&state.selected.peek().clone()) else {
+/// The scan and node a path refers to: in a location, the scan on screen; in an overview,
+/// the closest scan that contains it.
+fn target_of(state: &AppState, path: &Path) -> Option<(Arc<super::Session>, NodeId)> {
+    if state.overview.peek().is_some() {
+        return state.resolve(path);
+    }
+    let (session, _) = state.resolve(&state.selected.peek().clone())?;
+    let id = session.tree.read().find(path)?;
+    Some((session, id))
+}
+
+fn is_checked(state: &AppState, path: &Path, id: NodeId) -> bool {
+    match *state.overview.peek() {
+        Some(Overview::Projects) => state.dev_checked.peek().contains(path),
+        Some(Overview::Apps) => false,
+        None => state.view.peek().checked.contains(&id),
+    }
+}
+
+fn toggle_checked(mut state: AppState, path: &Path, id: NodeId) {
+    match *state.overview.peek() {
+        Some(Overview::Projects) => state.dev_checked.with_mut(|c| {
+            if !c.remove(path) {
+                c.insert(path.to_path_buf());
+            }
+        }),
+        // Apps are checked for uninstalling as a whole, not folder by folder.
+        Some(Overview::Apps) => {}
+        None => state.view.with_mut(|v| {
+            if !v.checked.remove(&id) {
+                v.checked.insert(id);
+            }
+        }),
+    }
+}
+
+/// Opens the native context menu for `path`; the choice arrives in [`context_action`].
+pub fn show_context_menu(mut state: AppState, path: PathBuf) {
+    let Some((session, id)) = target_of(&state, &path) else {
         return;
     };
     let tree = session.tree.read();
     let is_dir = tree.node(id).is_dir();
     let protected = is_protected(&tree, id);
-    let checked = state.view.peek().checked.contains(&id);
     drop(tree);
+    let checked = is_checked(&state, &path, id);
+    let markable = !protected && *state.overview.peek() != Some(Overview::Apps);
     let idle = session.busy() == Busy::Idle;
-    state.context_target.set(Some(id));
+    state.context_target.set(Some(path));
 
     let menu = Menu::new();
     let entries: Vec<Option<(&str, &str, bool)>> = vec![
@@ -508,7 +548,7 @@ fn show_context_menu(mut state: AppState, id: NodeId) {
         None,
         Some(("ctx-rescan", "Rescan Folder", is_dir && idle)),
         None,
-        Some(("ctx-check", if checked { "Unmark for Removal" } else { "Mark for Removal" }, !protected)),
+        Some(("ctx-check", if checked { "Unmark for Removal" } else { "Mark for Removal" }, markable)),
         Some(("ctx-trash", "Move to Trash", !protected && idle)),
         Some(("ctx-delete", "Delete Immediately…", !protected && idle)),
     ];
@@ -525,27 +565,19 @@ fn show_context_menu(mut state: AppState, id: NodeId) {
     }
 }
 
-pub fn context_action(mut state: AppState, action: &str) {
-    let Some(id) = *state.context_target.peek() else {
+pub fn context_action(state: AppState, action: &str) {
+    let Some(path) = state.context_target.peek().clone() else {
         return;
     };
-    let Some((session, _)) = state.resolve(&state.selected.peek().clone()) else {
+    let Some((session, id)) = target_of(&state, &path) else {
         return;
     };
-    if !session.tree.read().is_attached(id) {
-        return;
-    }
-    let path = session.tree.read().path(id);
     match action {
         "ctx-reveal" => ops::reveal_in_finder(&path),
         "ctx-quicklook" => ops::quick_look(&path),
         "ctx-rescan" => state.rescan_folder(session, id),
-        "ctx-check" => state.view.with_mut(|v| {
-            if !v.checked.remove(&id) {
-                v.checked.insert(id);
-            }
-        }),
-        "ctx-trash" => trash_one(state, session, id),
+        "ctx-check" => toggle_checked(state, &path, id),
+        "ctx-trash" => trash_one(state, path),
         "ctx-delete" => {
             spawn(async move {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -559,7 +591,7 @@ pub fn context_action(mut state: AppState, action: &str) {
                 if confirmed == rfd::MessageDialogResult::Custom("Delete".into())
                     || confirmed == rfd::MessageDialogResult::Ok
                 {
-                    let failed = run_removal(state, session, vec![(id, path)], false).await;
+                    let failed = run_removal(state, vec![path], false).await;
                     report_failures(failed).await;
                 }
             });
@@ -568,10 +600,9 @@ pub fn context_action(mut state: AppState, action: &str) {
     }
 }
 
-fn trash_one(state: AppState, session: Arc<super::Session>, id: NodeId) {
-    let path = session.tree.read().path(id);
+fn trash_one(state: AppState, path: PathBuf) {
     spawn(async move {
-        let failed = run_removal(state, session, vec![(id, path)], true).await;
+        let failed = run_removal(state, vec![path], true).await;
         report_failures(failed).await;
     });
 }
@@ -591,20 +622,19 @@ async fn report_failures(failed: Vec<(PathBuf, String)>) {
         .await;
 }
 
-/// Removes items on a background thread, then drops the ones that are gone from the tree.
+/// Removes items on a background thread, then drops the ones that are gone from every scan.
 /// Returns the failures as (path, error message).
 pub async fn run_removal(
     state: AppState,
-    session: Arc<super::Session>,
-    items: Vec<(NodeId, PathBuf)>,
+    paths: Vec<PathBuf>,
     to_trash: bool,
 ) -> Vec<(PathBuf, String)> {
     let results = tokio::task::spawn_blocking(move || {
-        items
+        paths
             .into_iter()
-            .map(|(id, path)| {
+            .map(|path| {
                 let r = if to_trash { ops::move_to_trash(&path) } else { ops::delete_now(&path) };
-                (id, path, r)
+                (path, r)
             })
             .collect::<Vec<_>>()
     })
@@ -612,28 +642,31 @@ pub async fn run_removal(
     .unwrap_or_default();
     let mut removed = Vec::new();
     let mut failed = Vec::new();
-    for (id, path, r) in results {
+    for (path, r) in results {
         match r {
-            Ok(()) => removed.push(id),
-            // Already gone counts as removed, so the tree stops showing it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed.push(id),
+            Ok(()) => removed.push(path),
+            // Already gone counts as removed, so the scans stop showing it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed.push(path),
             Err(e) => failed.push((path, e.to_string())),
         }
     }
-    state.forget(&session, &removed);
-    if to_trash {
-        refresh_trash(state, &session);
+    state.forget_paths(&removed);
+    if to_trash && !removed.is_empty() {
+        refresh_trash(state);
     }
     failed
 }
 
-/// Moving to the Trash keeps the bytes on disk, now inside the Trash folder. Rescan it so
-/// the tree shows where the space went.
-fn refresh_trash(state: AppState, session: &Arc<super::Session>) {
-    let trash = super::state::home_dir().join(".Trash");
-    let id = session.tree.read().find(&trash);
-    if let Some(id) = id {
-        state.rescan_folder(session.clone(), id);
+/// Moving to the Trash keeps the bytes on disk, now inside the Trash folder. Rescan it in
+/// every scan that contains it, so the trees show where the space went.
+fn refresh_trash(state: AppState) {
+    let trash = home_dir().join(".Trash");
+    let sessions: Vec<Arc<super::Session>> = state.sessions.peek().values().cloned().collect();
+    for session in sessions {
+        let id = session.tree.read().find(&trash);
+        if let Some(id) = id {
+            state.rescan_folder(session, id);
+        }
     }
 }
 

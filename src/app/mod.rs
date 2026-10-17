@@ -1,6 +1,8 @@
 //! The Dioxus user interface.
 
+mod apps_view;
 mod browser;
+mod developer;
 mod format;
 mod icons;
 mod overview;
@@ -226,6 +228,7 @@ fn open_folder(mut state: AppState, path: PathBuf) {
 }
 
 pub fn select_location(mut state: AppState, path: PathBuf) {
+    state.overview.set(None);
     if *state.selected.peek() != path {
         state.selected.set(path.clone());
         state.view.set(View::default());
@@ -255,6 +258,11 @@ fn App() -> Element {
         view: Signal::new(View::default()),
         review_open: Signal::new(false),
         context_target: Signal::new(None),
+        overview: Signal::new(None),
+        dev_checked: Signal::new(Default::default()),
+        dev_filter: Signal::new(None),
+        apps_checked: Signal::new(Default::default()),
+        brew: Signal::new(state::BrewState::NotLoaded),
     });
     use_hook(native_chrome);
     #[cfg(debug_assertions)]
@@ -327,7 +335,7 @@ fn App() -> Element {
             "choose-folder" => {
                 spawn(choose_folder(state));
             }
-            "rescan" => toolbar::rescan_current(state),
+            "rescan" if state.overview.peek().is_none() => toolbar::rescan_current(state),
             "find" => {
                 document::eval("document.getElementById('search')?.focus()");
             }
@@ -342,8 +350,18 @@ fn App() -> Element {
         div { class: "window",
             sidebar::Sidebar {}
             main { class: "main",
-                toolbar::Toolbar {}
-                Content {}
+                match (state.overview)() {
+                    Some(state::Overview::Projects) => rsx! {
+                        developer::DevToolbar {}
+                        developer::DevView {}
+                    },
+                    // Renders its own toolbar, which holds its filter.
+                    Some(state::Overview::Apps) => rsx! { apps_view::AppsView {} },
+                    None => rsx! {
+                        toolbar::Toolbar {}
+                        Content {}
+                    },
+                }
             }
             if (state.review_open)() {
                 remove::ReviewSheet {}

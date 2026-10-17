@@ -5242,6 +5242,8 @@ dependencies = [
  "parking_lot",
  "quicklook",
  "rfd",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "trash",

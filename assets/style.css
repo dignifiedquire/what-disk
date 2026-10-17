@@ -928,3 +928,155 @@ input:focus-visible,
 .sheet-buttons .spacer {
   flex: 1;
 }
+
+/* ---------- Developer view ---------- */
+
+.dev-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 12px 12px;
+}
+
+.dev-section {
+  margin-top: 8px;
+}
+
+.dev-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  margin: 0;
+  padding: 8px 8px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--content);
+  border-bottom: 0.5px solid var(--separator);
+}
+
+.dev-heading .secondary {
+  font-weight: 400;
+}
+
+.row.dev-row {
+  min-height: 44px;
+  gap: 10px;
+  padding: 4px 10px 4px 6px;
+}
+
+.row.dev-row.checked {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.badge {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.badge.rust {
+  color: #b7410e;
+  background: rgba(183, 65, 14, 0.14);
+}
+
+.badge.js {
+  color: #8a6d00;
+  background: rgba(240, 200, 0, 0.2);
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge.rust {
+    color: #ff8a50;
+    background: rgba(255, 138, 80, 0.16);
+  }
+
+  .badge.js {
+    color: #f7df1e;
+    background: rgba(247, 223, 30, 0.14);
+  }
+}
+
+.dev-what,
+.dev-age {
+  flex: none;
+  font-size: 12px;
+  color: var(--secondary);
+  white-space: nowrap;
+}
+
+.dev-what {
+  width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dev-age {
+  width: 130px;
+  text-align: right;
+}
+
+.dev-row .size {
+  width: 76px;
+  text-align: right;
+}
+
+/* ---------- Apps view ---------- */
+
+.apps-heading {
+  align-items: baseline;
+  gap: 10px;
+}
+
+.apps-title {
+  flex: 1;
+}
+
+.apps-col {
+  width: 84px;
+  flex: none;
+  text-align: right;
+}
+
+.apps-heading .apps-col {
+  font-weight: 400;
+  color: var(--secondary);
+}
+
+.apps-heading .apps-col:last-child {
+  width: 104px;
+  margin-right: 22px;
+}
+
+.app-row .apps-col.total {
+  width: 104px;
+  color: var(--label);
+}
+
+.disclosure.open .symbol {
+  transform: rotate(90deg);
+}
+
+.app-parts {
+  margin: 0 0 6px 44px;
+  padding-left: 10px;
+  border-left: 0.5px solid var(--separator);
+}
+
+.row.part-row {
+  min-height: 24px;
+  gap: 8px;
+}
+
+.part-label {
+  width: 140px;
+  flex: none;
+}
+
+.part-path {
+  flex: 1;
+  min-width: 0;
+}

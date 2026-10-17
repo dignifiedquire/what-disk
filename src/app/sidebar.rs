@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use super::format;
 use super::icons::{Icon, Symbol};
-use super::state::{Busy, Location, LocationKind, use_app_state};
+use super::state::{Busy, Location, LocationKind, Overview, use_app_state};
 use super::{choose_folder, select_location};
 
 fn icon_for(location: &Location) -> Icon {
@@ -46,6 +46,9 @@ pub fn Sidebar() -> Element {
                 for l in volumes {
                     SidebarItem { location: l.clone() }
                 }
+                div { class: "sidebar-heading", "Overviews" }
+                OverviewItem { overview: Overview::Apps, icon: Icon::Apps, label: "Apps" }
+                OverviewItem { overview: Overview::Projects, icon: Icon::Code, label: "Projects & Toolchains" }
                 div { class: "sidebar-heading", "Folders" }
                 for l in folders {
                     SidebarItem { location: l.clone() }
@@ -64,10 +67,24 @@ pub fn Sidebar() -> Element {
 }
 
 #[component]
+fn OverviewItem(overview: Overview, icon: Icon, label: &'static str) -> Element {
+    let mut state = use_app_state();
+    let selected = (state.overview)() == Some(overview);
+    rsx! {
+        button {
+            class: if selected { "sidebar-item selected" } else { "sidebar-item" },
+            onclick: move |_| state.overview.set(Some(overview)),
+            Symbol { icon }
+            span { class: "sidebar-name", "{label}" }
+        }
+    }
+}
+
+#[component]
 fn SidebarItem(location: Location) -> Element {
     let state = use_app_state();
     let _ = (state.rev)();
-    let selected = *state.selected.read() == location.path;
+    let selected = *state.selected.read() == location.path && (state.overview)().is_none();
     let scanning = state
         .sessions
         .read()

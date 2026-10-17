@@ -1,5 +1,8 @@
 mod app;
+mod apps;
+mod brew;
 mod cache;
+mod dev;
 mod ops;
 mod scan;
 mod tree;

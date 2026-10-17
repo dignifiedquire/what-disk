@@ -6,9 +6,9 @@ use std::sync::atomic::Ordering;
 use dioxus::prelude::*;
 
 use super::browser::run_removal;
-use super::state::{Busy, effective_checked, is_protected, use_app_state};
+use super::state::{AppState, Busy, Overview, effective_checked, is_protected, use_app_state};
 use super::{SessionRef, format, icon_url};
-use crate::tree::{NodeId, ROOT};
+use crate::tree::{NodeId, ROOT, Tree};
 
 #[component]
 pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
@@ -86,28 +86,41 @@ enum Phase {
     Failed(Vec<(PathBuf, String)>),
 }
 
+/// What the sheet would remove, as (name, path, size): the checked folders of the Developer
+/// view, or the checked items of the scan on screen.
+fn pending_items(state: AppState) -> Vec<(String, PathBuf, u64)> {
+    let describe = |tree: &Tree, id: NodeId| (tree.display_name(id).into_owned(), tree.path(id), tree.size(id));
+    if (state.overview)() == Some(Overview::Projects) {
+        return state
+            .dev_checked
+            .read()
+            .iter()
+            .filter_map(|p| state.resolve(p))
+            .filter(|(s, id)| !is_protected(&s.tree.read(), *id))
+            .map(|(s, id)| describe(&s.tree.read(), id))
+            .collect();
+    }
+    let Some((session, _)) = state.resolve(&state.selected.peek().clone()) else {
+        return Vec::new();
+    };
+    let tree = session.tree.read();
+    effective_checked(&tree, &state.view.read().checked)
+        .into_iter()
+        .filter(|&id| !is_protected(&tree, id))
+        .map(|id| describe(&tree, id))
+        .collect()
+}
+
 #[component]
 pub fn ReviewSheet() -> Element {
     let mut state = use_app_state();
     let mut phase = use_signal(|| Phase::Review);
-    let selected = state.selected.peek().clone();
-    let Some((session, _)) = state.resolve(&selected) else {
-        state.review_open.set(false);
-        return rsx! {};
-    };
-    let tree = session.tree.read();
-    let items: Vec<(NodeId, String, PathBuf, u64)> = effective_checked(&tree, &state.view.read().checked)
-        .into_iter()
-        .filter(|&id| !is_protected(&tree, id))
-        .map(|id| (id, tree.display_name(id).into_owned(), tree.path(id), tree.size(id)))
-        .collect();
-    drop(tree);
-    let total: u64 = items.iter().map(|i| i.3).sum();
-    let targets: Vec<(NodeId, PathBuf)> = items.iter().map(|i| (i.0, i.2.clone())).collect();
+    let items = pending_items(state);
+    let total: u64 = items.iter().map(|i| i.2).sum();
+    let targets: Vec<PathBuf> = items.iter().map(|i| i.1.clone()).collect();
     let working = phase() == Phase::Working;
 
     let remove = move |to_trash: bool| {
-        let session = session.clone();
         let targets = targets.clone();
         async move {
             if !to_trash {
@@ -129,7 +142,7 @@ pub fn ReviewSheet() -> Element {
                 }
             }
             phase.set(Phase::Working);
-            let failed = run_removal(state, session, targets, to_trash).await;
+            let failed = run_removal(state, targets, to_trash).await;
             if failed.is_empty() {
                 state.review_open.set(false);
             } else {
@@ -172,8 +185,8 @@ pub fn ReviewSheet() -> Element {
                             "Moving to the Trash frees the space once the Trash is emptied."
                         }
                         ul { class: "sheet-list",
-                            for (id, name, path, size) in items.clone() {
-                                li { class: "sheet-item", key: "{id}",
+                            for (name, path, size) in items.clone() {
+                                li { class: "sheet-item", key: "{path.display()}",
                                     img { src: "{icon_url(&path)}", width: "16", height: "16" }
                                     div { class: "label",
                                         span { class: "name", "{name}" }

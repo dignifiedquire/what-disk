@@ -18,6 +18,8 @@ pub enum Icon {
     Clear,
     Lock,
     Stop,
+    Code,
+    Apps,
 }
 
 impl Icon {
@@ -41,6 +43,8 @@ impl Icon {
             Icon::Clear => "M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zM7.3 7.3l5.4 5.4M12.7 7.3l-5.4 5.4",
             Icon::Lock => "M5 9h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1zM7 9V6.5a3 3 0 0 1 6 0V9",
             Icon::Stop => "M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zM7.5 7.5h5v5h-5z",
+            Icon::Code => "M6.5 5.5 2 10l4.5 4.5M13.5 5.5 18 10l-4.5 4.5M11.5 3.5l-3 13",
+            Icon::Apps => "M3 3h5.5v5.5H3zM11.5 3H17v5.5h-5.5zM3 11.5h5.5V17H3zM11.5 11.5H17V17h-5.5z",
         }
     }
 }

@@ -9,7 +9,9 @@ use std::time::SystemTime;
 use dioxus::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
+use crate::brew::{self, Brew};
 use crate::cache;
+use crate::dev::Language;
 use crate::scan::{self, Outcome, Progress};
 use crate::tree::{NodeId, ROOT, Tree, flags};
 use crate::volumes::{self, Boundary, Volume};
@@ -37,7 +39,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(root: &Path, name: &str) -> Self {
+    pub(super) fn new(root: &Path, name: &str) -> Self {
         Session {
             root: root.to_path_buf(),
             tree: RwLock::new(Tree::new(root.to_path_buf(), name, 0)),
@@ -79,6 +81,22 @@ pub struct Location {
     pub path: PathBuf,
     pub name: String,
     pub kind: LocationKind,
+}
+
+/// A screen that combines all scans instead of showing one location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overview {
+    Projects,
+    Apps,
+}
+
+/// Homebrew's installed packages, loaded once per run since `brew` takes seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrewState {
+    NotLoaded,
+    Loading,
+    Ready(Arc<Brew>),
+    Unavailable(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +141,16 @@ pub struct AppState {
     pub rev: Signal<u64>,
     pub view: Signal<View>,
     pub review_open: Signal<bool>,
-    pub context_target: Signal<Option<NodeId>>,
+    /// The item the open context menu acts on.
+    pub context_target: Signal<Option<PathBuf>>,
+    /// An overview is shown instead of the selected location.
+    pub overview: Signal<Option<Overview>>,
+    /// Folders checked in the Projects overview. Paths, since they come from several scans.
+    pub dev_checked: Signal<BTreeSet<PathBuf>>,
+    pub dev_filter: Signal<Option<Language>>,
+    /// Entries checked for uninstalling in the Apps overview, by their key path.
+    pub apps_checked: Signal<BTreeSet<PathBuf>>,
+    pub brew: Signal<BrewState>,
 }
 
 pub fn use_app_state() -> AppState {
@@ -300,20 +327,66 @@ impl AppState {
         session.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Removes nodes that were deleted on disk from the tree and persists the result.
-    pub fn forget(mut self, session: &Arc<Session>, ids: &[NodeId]) {
-        {
-            let mut tree = session.tree.write();
-            for &id in ids {
-                if tree.is_attached(id) {
+    /// Drops paths that were deleted on disk from every loaded scan that contains them, so
+    /// overlapping scans (a volume and a folder on it) stay consistent, and saves those scans.
+    pub fn forget_paths(mut self, paths: &[PathBuf]) {
+        let sessions: Vec<Arc<Session>> = self.sessions.peek().values().cloned().collect();
+        for session in sessions {
+            let changed = {
+                let mut tree = session.tree.write();
+                let ids: Vec<NodeId> = paths
+                    .iter()
+                    .filter_map(|p| tree.find(p))
+                    .filter(|&id| id != ROOT)
+                    .collect();
+                for &id in &ids {
                     tree.remove(id);
                 }
+                !ids.is_empty()
+            };
+            if changed {
+                std::thread::spawn(move || {
+                    session.save();
+                    // Lets the sidebar pick up the new total from the saved scan.
+                    session.version.fetch_add(1, Ordering::Relaxed);
+                });
             }
         }
-        self.view.with_mut(|v| v.checked.retain(|id| !ids.contains(id)));
-        let s = session.clone();
-        std::thread::spawn(move || s.save());
+        if let Some((session, _)) = self.resolve(&self.selected.peek().clone()) {
+            let tree = session.tree.read();
+            self.view.with_mut(|v| v.checked.retain(|&id| tree.is_attached(id)));
+        }
+        self.dev_checked.with_mut(|c| c.retain(|p| !paths.contains(p)));
         self.rev.with_mut(|r| *r += 1);
+    }
+
+    /// Asks Homebrew what is installed, in the background. `force` reloads after changes.
+    pub fn load_brew(mut self, force: bool) {
+        let current = self.brew.peek().clone();
+        if !force && current != BrewState::NotLoaded || current == BrewState::Loading {
+            return;
+        }
+        let Some(executable) = brew::find() else {
+            self.brew.set(BrewState::Unavailable("Homebrew is not installed.".into()));
+            return;
+        };
+        self.brew.set(BrewState::Loading);
+        spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || brew::load(&executable)).await;
+            self.brew.set(match loaded {
+                Ok(Ok(b)) => BrewState::Ready(Arc::new(b)),
+                Ok(Err(e)) => BrewState::Unavailable(e.to_string()),
+                Err(e) => BrewState::Unavailable(e.to_string()),
+            });
+        });
+    }
+
+    /// Loads every cached scan that no loaded scan covers yet.
+    pub fn load_all_cached(self) {
+        let roots: Vec<PathBuf> = self.summaries.peek().keys().cloned().collect();
+        for root in roots {
+            self.ensure_loaded(&root);
+        }
     }
 
     /// Re-reads cache summaries and volume capacities after background work finished.
@@ -322,12 +395,33 @@ impl AppState {
             .into_iter()
             .map(|s| (s.root.clone(), s))
             .collect();
-        let locations = default_locations(&summaries);
+        let mut locations = default_locations(&summaries);
+        // Keep folders the user opened that have no scan yet.
+        for l in self.locations.peek().iter() {
+            if !locations.iter().any(|n| n.path == l.path) {
+                locations.push(l.clone());
+            }
+        }
         self.summaries.set(summaries);
         if *self.locations.peek() != locations {
             self.locations.set(locations);
         }
     }
+}
+
+/// Changes when lists computed from the trees should be recomputed: on every change while
+/// idle, but at most every two seconds while a scan runs, since walking millions of nodes
+/// four times a second would stall the interface.
+pub fn use_list_trigger(state: AppState) -> Memo<(bool, u64)> {
+    use_memo(move || {
+        let rev = (state.rev)();
+        let busy = state
+            .sessions
+            .peek()
+            .values()
+            .any(|s| matches!(s.busy(), Busy::Scanning | Busy::Rescanning(_)));
+        if busy { (true, rev / 8) } else { (false, rev) }
+    })
 }
 
 /// Checked items, without items whose ancestor is also checked (deleting the ancestor
