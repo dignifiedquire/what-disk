@@ -287,8 +287,14 @@ fn attach_temp_files(scans: &Scans, report: &mut AppsReport) {
         };
         let tree = session.tree.read();
         for id in tree.children(root_id) {
+            let path = tree.path(id);
+            // Only the owner may remove an item from the shared temporary folders, and helpers
+            // running as root leave items there; offering those for uninstalling only fails.
+            if owned_by_another_user(&path) {
+                continue;
+            }
             let owner = temp::owner(&tree.display_name(id), &ids);
-            let part = Part { path: tree.path(id), label: kind.label().into(), size: Some(tree.size(id)) };
+            let part = Part { path, label: kind.label().into(), size: Some(tree.size(id)) };
             let target = match &owner {
                 Owner::App(bundle) => report.entries.iter_mut().find(|e| e.bundle_id.as_ref() == Some(bundle)),
                 Owner::Tool(tool) => report.entries.iter_mut().find(|e| e.name.eq_ignore_ascii_case(tool)),
@@ -315,6 +321,13 @@ fn attach_temp_files(scans: &Scans, report: &mut AppsReport) {
             data: parts,
         });
     }
+}
+
+fn owned_by_another_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() != uid)
 }
 
 fn temp_group_name(owner: &Owner) -> String {
@@ -695,6 +708,8 @@ fn UninstallSheet(entries: Vec<AppEntry>, open: Signal<bool>) -> Element {
     let mut open = open;
     let mut working = use_signal(|| false);
     let mut failures = use_signal(Vec::<(String, String)>::new);
+    // Uninstalled entries leave the list, so the title keeps the count it started with.
+    let count = use_hook(|| entries.len());
     let total: u64 = entries.iter().map(AppEntry::total).sum();
     let uses_brew = entries.iter().any(|e| matches!(e.kind, EntryKind::Cask { .. } | EntryKind::Formula { .. }));
     let run_entries = entries.clone();
@@ -724,7 +739,7 @@ fn UninstallSheet(entries: Vec<AppEntry>, open: Signal<bool>) -> Element {
     rsx! {
         div { class: "sheet-backdrop",
             div { class: "sheet",
-                h2 { "Uninstall {entries.len()} " if entries.len() == 1 { "item" } else { "items" } }
+                h2 { "Uninstall {count} " if count == 1 { "item" } else { "items" } }
                 if failures.read().is_empty() {
                     ul { class: "sheet-list",
                         for e in entries.iter() {
@@ -788,6 +803,17 @@ mod tests {
     use crate::brew::{Cask, Formula};
     use crate::tree::{Kind, ROOT, Tree, flags};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn temporary_items_of_other_users_are_not_offered_for_uninstalling() {
+        // Root helpers leave items in /private/var/tmp that only root may remove; listing
+        // them under an app made every uninstall of that app fail.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!owned_by_another_user(tmp.path()));
+        assert!(owned_by_another_user(Path::new("/private/var/tmp")));
+        // Gone since the scan: removing it succeeds trivially, so it may stay listed.
+        assert!(!owned_by_another_user(&tmp.path().join("missing")));
+    }
 
     fn session(root: &str, build: impl FnOnce(&mut Tree)) -> Arc<Session> {
         let s = Session::new(Path::new(root), "x");

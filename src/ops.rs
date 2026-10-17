@@ -10,16 +10,25 @@ use objc2_app_kit::{
     NSWorkspace,
 };
 use objc2_app_kit::NSImage;
-use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSDictionary, NSFileManager, NSPoint, NSRect, NSSize, NSString, NSURL};
 use objc2_uniform_type_identifiers::UTType;
 
 /// Moves `path` to the Trash of its volume. Uses NSFileManager directly rather than
-/// scripting Finder, which would ask for Automation permission.
+/// scripting Finder, which would ask for Automation permission. Errors carry the system's
+/// own explanation, such as missing permission, so they can be shown as they are.
 pub fn move_to_trash(path: &Path) -> io::Result<()> {
-    use trash::macos::{DeleteMethod, TrashContextExtMacos};
-    let mut ctx = trash::TrashContext::default();
-    ctx.set_delete_method(DeleteMethod::NsFileManager);
-    ctx.delete(path).map_err(|e| io::Error::other(e.to_string()))
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, None)
+        .map_err(|e| {
+            // Cocoa error codes: NSFileNoSuchFileError, NSFile{Read,Write}NoPermissionError.
+            let kind = match e.code() {
+                4 => io::ErrorKind::NotFound,
+                257 | 513 => io::ErrorKind::PermissionDenied,
+                _ => io::ErrorKind::Other,
+            };
+            io::Error::new(kind, e.localizedDescription().to_string())
+        })
 }
 
 /// Deletes `path` permanently. Symbolic links are removed, never followed.
@@ -151,6 +160,29 @@ fn render_png(image: &NSImage, pixels: isize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_move_to_trash_explains_itself() {
+        // Removal failures are shown to the user as they are, so they must be the system's
+        // sentence, not debug output. The folder is read-only, so nothing reaches the Trash.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let file = locked.join("helper.pid");
+        std::fs::write(&file, b"1").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = move_to_trash(&file).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(file.exists());
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let message = err.to_string();
+        assert!(message.contains("helper.pid") && !message.contains("trashItemAtURL"), "{message}");
+
+        let missing = move_to_trash(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound, "{missing}");
+    }
 
     #[test]
     fn delete_now_removes_folders_and_does_not_follow_symlinks() {
