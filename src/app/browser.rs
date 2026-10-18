@@ -1,16 +1,21 @@
 //! The scanned view: column browser or item list on the left, sunburst on the right.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use dioxus::desktop::muda::{ContextMenu, Menu, MenuItem, PredefinedMenuItem};
 use dioxus::desktop::tao::platform::macos::WindowExtMacOS;
 use dioxus::prelude::*;
+use parking_lot::Mutex;
 
 use super::icons::{Icon, Symbol};
 use super::remove::BottomBar;
 use super::state::{
-    AppState, Busy, Mode, Overview, home_dir, is_protected, run_list_work, use_app_state, use_list_trigger,
+    AppState, Busy, Mode, Overview, Removal, home_dir, is_protected, run_list_work, use_app_state,
+    use_list_trigger,
 };
 use super::sunburst::Sunburst;
 use super::{SessionRef, format, icon_url, type_icon_url};
@@ -98,6 +103,21 @@ fn selection_to(tree: &Store, root: NodeId, id: NodeId) -> Vec<NodeId> {
     let chain = tree.ancestry(id);
     let start = chain.iter().position(|&a| a == root).map_or(chain.len(), |p| p + 1);
     chain[start..].to_vec()
+}
+
+/// Leaves the overview for the scan that holds `path`, with `path` selected in the columns
+/// and, for a folder, what is inside it next to it.
+pub fn show_in_scan(mut state: AppState, path: &Path) {
+    let Some((session, id)) = state.resolve(path) else {
+        return;
+    };
+    let selection = selection_to(&session.store(), ROOT, id);
+    super::select_location(state, session.root.clone());
+    state.view.with_mut(|v| {
+        v.mode = Mode::Outline;
+        v.query.clear();
+        v.selection = selection;
+    });
 }
 
 #[component]
@@ -560,19 +580,28 @@ pub fn show_context_menu(mut state: AppState, path: PathBuf) {
     let checked = is_checked(&state, &path, id);
     let markable = !protected && *state.overview.peek() != Some(Overview::Apps);
     let idle = session.busy() == Busy::Idle;
+    let removable = !protected && idle && state.removal.peek().is_none();
+    // An overview lists items from all scans; this opens the one holding the item.
+    let show_in = state.overview.peek().is_some().then(|| {
+        let name = state.location(&session.root).map_or_else(|| session.root.display().to_string(), |l| l.name);
+        format!("Show in “{name}”")
+    });
     state.context_target.set(Some(path));
 
     let menu = Menu::new();
-    let entries: Vec<Option<(&str, &str, bool)>> = vec![
+    let mut entries: Vec<Option<(&str, &str, bool)>> = vec![
         Some(("ctx-reveal", "Show in Finder", true)),
         Some(("ctx-quicklook", "Quick Look", true)),
         None,
         Some(("ctx-rescan", "Rescan Folder", is_dir && idle)),
         None,
         Some(("ctx-check", if checked { "Unmark for Removal" } else { "Mark for Removal" }, markable)),
-        Some(("ctx-trash", "Move to Trash", !protected && idle)),
-        Some(("ctx-delete", "Delete Immediately…", !protected && idle)),
+        Some(("ctx-trash", "Move to Trash", removable)),
+        Some(("ctx-delete", "Delete Immediately…", removable)),
     ];
+    if let Some(label) = &show_in {
+        entries.insert(0, Some(("ctx-show", label, true)));
+    }
     for e in entries {
         let _ = match e {
             Some((id, label, enabled)) => menu.append(&MenuItem::with_id(id, label, enabled, None)),
@@ -599,6 +628,7 @@ pub fn context_action(state: AppState, action: &str) {
         return;
     };
     match action {
+        "ctx-show" => show_in_scan(state, &path),
         "ctx-reveal" => ops::reveal_in_finder(&path),
         "ctx-quicklook" => ops::quick_look(&path),
         "ctx-rescan" => state.rescan_folder(session, id),
@@ -648,39 +678,117 @@ async fn report_failures(failed: Vec<(PathBuf, String)>) {
         .await;
 }
 
-/// Removes items on a background thread, then drops the ones that are gone from every scan.
-/// Returns the failures as (path, error message).
+/// What the thread of a removal has done so far.
+#[derive(Default)]
+struct RemovalWork {
+    current: AtomicUsize,
+    bytes: AtomicU64,
+    finished: Mutex<Vec<(PathBuf, io::Result<()>)>>,
+}
+
+/// Removes items one after another on a background thread. Each item leaves the scans as
+/// soon as it is gone, and `state.removal` shows how far it got. Returns the failures as
+/// (path, error message).
 pub async fn run_removal(
-    state: AppState,
+    mut state: AppState,
     paths: Vec<PathBuf>,
     to_trash: bool,
 ) -> Vec<(PathBuf, String)> {
-    let results = tokio::task::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|path| {
-                let r = if to_trash { ops::move_to_trash(&path) } else { ops::delete_now(&path) };
-                (path, r)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-    for (path, r) in results {
-        match r {
-            Ok(()) => removed.push(path),
-            // Already gone counts as removed, so the scans stop showing it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed.push(path),
-            Err(e) => failed.push((path, e.to_string())),
+    let items: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let found = state.resolve(&path);
+            let size = found.as_ref().map_or(0, |(s, id)| s.store().size(*id));
+            (path, found, size)
+        })
+        .collect();
+    let names: Vec<String> = items
+        .iter()
+        .map(|(p, ..)| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()))
+        .collect();
+    let total = items.iter().map(|i| i.2).sum();
+    let work = Arc::new(RemovalWork::default());
+    let worker = tokio::task::spawn_blocking({
+        let work = work.clone();
+        move || {
+            let mut before = 0;
+            for (i, (path, found, size)) in items.into_iter().enumerate() {
+                work.current.store(i, Ordering::Relaxed);
+                let result = if to_trash {
+                    ops::move_to_trash(&path)
+                } else if let Some((session, id)) = found {
+                    let piece = (size / 100).max(1 << 20);
+                    delete_in_pieces(&session.store(), id, &path, piece, &mut |n| {
+                        work.bytes.fetch_add(n, Ordering::Relaxed);
+                    })
+                    .map(|_| ())
+                } else {
+                    ops::delete_now(&path)
+                };
+                before += size;
+                work.bytes.store(before, Ordering::Relaxed);
+                work.finished.lock().push((path, result));
+            }
         }
+    });
+
+    let mut trashed = false;
+    let mut failed = Vec::new();
+    loop {
+        // Checked first: everything the thread finished before it ended is collected below.
+        let ended = worker.is_finished();
+        let mut gone = Vec::new();
+        for (path, result) in std::mem::take(&mut *work.finished.lock()) {
+            match result {
+                Ok(()) => gone.push(path),
+                // Already gone counts as removed, so the scans stop showing it.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => gone.push(path),
+                Err(e) => failed.push((path, e.to_string())),
+            }
+        }
+        if !gone.is_empty() {
+            state.forget_paths(&gone);
+            trashed |= to_trash;
+        }
+        if ended || names.is_empty() {
+            break;
+        }
+        let current = work.current.load(Ordering::Relaxed).min(names.len() - 1);
+        state.removal.set(Some(Removal {
+            to_trash,
+            name: names[current].clone(),
+            current,
+            count: names.len(),
+            bytes: work.bytes.load(Ordering::Relaxed),
+            total,
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    state.forget_paths(&removed);
-    if to_trash && !removed.is_empty() {
+    state.removal.set(None);
+    if trashed {
         refresh_trash(state);
     }
     failed
+}
+
+/// Deletes `path`, which the scan knows as `id`, a piece at a time, so that a large folder
+/// shows progress: folders holding more than `piece` bytes go item by item. `freed` gets
+/// the bytes of each piece once it is gone, by the scan's sizes. Returns their sum.
+fn delete_in_pieces(store: &Store, id: NodeId, path: &Path, piece: u64, freed: &mut impl FnMut(u64)) -> io::Result<u64> {
+    let mut reported = 0;
+    // The scan can be old: only go into what is still a folder, never through a link.
+    if store.size(id) > piece && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        for (child, _, name) in store.entries(id) {
+            // A piece that fails is left to the delete below, which can also make read-only
+            // folders writable.
+            reported += delete_in_pieces(store, child, &path.join(name), piece, freed).unwrap_or(0);
+        }
+    }
+    // Also removes what the scan did not see.
+    ops::delete_now(path)?;
+    let rest = store.size(id).saturating_sub(reported);
+    freed(rest);
+    Ok(reported + rest)
 }
 
 /// Moving to the Trash keeps the bytes on disk, now inside the Trash folder. Rescan it in
@@ -730,5 +838,75 @@ mod tests {
         assert_eq!(current_folder(&t, ROOT, &[a, f]), a);
         assert_eq!(selection_to(&t, ROOT, f), vec![a, f]);
         assert_eq!(selection_to(&t, a, f), vec![f]);
+    }
+
+    #[test]
+    fn a_large_folder_is_deleted_in_pieces_that_report_progress() {
+        // Deleting a large folder took minutes with nothing moving on screen. Its pieces
+        // report their size as each is gone, and what the scan did not see goes as well.
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big");
+        std::fs::create_dir_all(big.join("a")).unwrap();
+        for i in 0..4 {
+            std::fs::write(big.join("a").join(format!("f{i}")), b"x").unwrap();
+        }
+        std::fs::write(big.join("b"), b"x").unwrap();
+        std::fs::write(big.join("new since the scan"), b"x").unwrap();
+        let mut s = Builder::new(tmp.path().to_str().unwrap(), "tmp");
+        let d = s.add(ROOT, b"big", Kind::Dir, 0, 0, 0);
+        let a = s.add(d, b"a", Kind::Dir, 0, 0, 0);
+        for i in 0..4 {
+            s.add(a, format!("f{i}").as_bytes(), Kind::File, 0, 200, 0);
+        }
+        s.add(d, b"b", Kind::File, 0, 100, 0);
+        let t = s.build();
+        let mut pieces = Vec::new();
+        let freed = delete_in_pieces(&t, t.id(d), &big, 150, &mut |n| pieces.push(n)).unwrap();
+        assert!(!big.exists());
+        assert_eq!(freed, 900);
+        // The files of `a`, then the emptied `a`, then `b`, then the emptied `big`.
+        assert_eq!(pieces, vec![200, 200, 200, 200, 0, 100, 0]);
+    }
+
+    #[test]
+    fn deleting_in_pieces_never_empties_a_folder_through_a_link() {
+        // The scan can be days old. A folder it saw that is now a link to somewhere else is
+        // removed as a link; what it points to stays.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        let big = tmp.path().join("big");
+        std::fs::create_dir(&big).unwrap();
+        std::os::unix::fs::symlink(&outside, big.join("was a folder")).unwrap();
+        let mut s = Builder::new(tmp.path().to_str().unwrap(), "tmp");
+        let d = s.add(ROOT, b"big", Kind::Dir, 0, 0, 0);
+        let was = s.add(d, b"was a folder", Kind::Dir, 0, 0, 0);
+        s.add(was, b"keep", Kind::File, 0, 1000, 0);
+        let t = s.build();
+        delete_in_pieces(&t, t.id(d), &big, 10, &mut |_| {}).unwrap();
+        assert!(!big.exists());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[test]
+    fn deleting_in_pieces_still_removes_read_only_folders() {
+        // In Go's read-only module cache the pieces cannot be removed one by one; the delete
+        // of the whole folder at the end makes the folders writable and removes them.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big");
+        let module = big.join("lib@v1.0.0");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("lib.go"), b"package lib").unwrap();
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut s = Builder::new(tmp.path().to_str().unwrap(), "tmp");
+        let d = s.add(ROOT, b"big", Kind::Dir, 0, 0, 0);
+        let m = s.add(d, b"lib@v1.0.0", Kind::Dir, 0, 0, 0);
+        s.add(m, b"lib.go", Kind::File, 0, 1000, 0);
+        let t = s.build();
+        let freed = delete_in_pieces(&t, t.id(d), &big, 10, &mut |_| {}).unwrap();
+        assert!(!big.exists());
+        assert_eq!(freed, 1000);
     }
 }

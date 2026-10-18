@@ -9,7 +9,8 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use super::browser::show_context_menu;
-use super::state::{BrewState, Busy, Session, home_dir, run_list_work, use_app_state, use_list_trigger};
+use super::remove::RemovalStatus;
+use super::state::{AppState, BrewState, Busy, Session, home_dir, run_list_work, use_app_state, use_list_trigger};
 use super::{format, icon_url};
 use crate::apps::{self, BundleInfo};
 use crate::brew::{self, Brew};
@@ -107,6 +108,18 @@ pub struct AppsReport {
     /// Folders the report needs that no scan covers yet. Scanning just these is enough;
     /// the whole disk is not needed.
     pub missing: Vec<PathBuf>,
+}
+
+/// Drops what the scans no longer have from `report`: removed parts, and entries whose app,
+/// or for entries without one all data, was removed. Parts no scan covered stay.
+fn without_removed(state: AppState, report: &mut AppsReport) {
+    let gone = |p: &Part| p.size.is_some() && state.resolve(&p.path).is_none();
+    report.entries.retain_mut(|e| {
+        let (had_install, had_data) = (!e.install.is_empty(), !e.data.is_empty());
+        e.install.retain(|p| !gone(p));
+        e.data.retain(|p| !gone(p));
+        if had_install { !e.install.is_empty() } else { !had_data || !e.data.is_empty() }
+    });
 }
 
 /// Loaded scans, newest first, for looking up sizes by path.
@@ -436,10 +449,21 @@ pub fn AppsView() -> Element {
         };
         async move {
             let home = home_dir();
-            if let Some(r) = run_list_work(move || collect(sessions, &home, brew.as_deref())).await {
+            if let Some(mut r) = run_list_work(move || collect(sessions, &home, brew.as_deref())).await {
+                // Items removed while this ran may still be in it.
+                without_removed(state, &mut r);
                 report.set(Some(r));
             }
         }
+    });
+    // Removed items leave at once; computing the report again takes seconds.
+    use_effect(move || {
+        let _ = (state.removals)();
+        report.with_mut(|r| {
+            if let Some(r) = r {
+                without_removed(state, r);
+            }
+        });
     });
     let mut filter = use_signal(|| Filter::All);
     let expanded = use_signal(BTreeSet::<PathBuf>::new);
@@ -535,7 +559,9 @@ pub fn AppsView() -> Element {
             }
             footer { class: "bottombar",
                 div { class: "bottombar-status",
-                    if selected.is_empty() {
+                    if let Some(removal) = (state.removal)() {
+                        RemovalStatus { removal }
+                    } else if selected.is_empty() {
                         span { class: "status-text secondary",
                             "Check apps to uninstall them. Expand an app to see its data; right-click a folder for more."
                         }

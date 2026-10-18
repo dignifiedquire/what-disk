@@ -11,7 +11,8 @@ interface that looks and behaves like a native Mac app.
 - **Browse** the results in Finder-style columns next to a sunburst chart, or list the
   biggest files, or search by name.
 - **Remove** files and folders: check them and choose Review and Remove, or right-click.
-  Items go to the Trash, or are deleted immediately after a confirmation.
+  Items go to the Trash, or are deleted immediately after a confirmation. Progress shows
+  in the sheet or the bottom bar, and each item leaves the views as soon as it is gone.
 - **Keep results**: every scan is saved and shown instantly the next time. Rescan a whole
   location or a single folder when you want fresh numbers.
 - **Pause and resume** a scan from the toolbar. A running scan saves its progress every two
@@ -21,7 +22,8 @@ interface that looks and behaves like a native Mac app.
   (`node_modules/`), Java (Maven `target/`, Gradle `build/` and `.gradle/`), C/C++ (CMake
   and Meson build folders), Swift (`.build/`), Python (virtual environments, `.tox`,
   `.nox` and tool caches) and Ruby (`vendor/bundle`, `tmp/cache`) projects, plus toolchain
-  caches and versions across all saved scans:
+  caches and versions across all saved scans. Double-click a folder, or right-click and
+  choose Show in, to see what is inside it in the scan that holds it:
   - Rust: Cargo, rustup, kache, sccache
   - JavaScript: nvm, Deno, npm, pnpm, Yarn, Bun
   - Go: module cache, build cache, golangci-lint, SDKs in `~/sdk`

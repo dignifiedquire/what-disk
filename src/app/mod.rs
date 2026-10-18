@@ -292,6 +292,8 @@ fn App() -> Element {
         rev: Signal::new(0),
         view: Signal::new(View::default()),
         review_open: Signal::new(false),
+        removal: Signal::new(None),
+        removals: Signal::new(0),
         context_target: Signal::new(None),
         overview: Signal::new(None),
         dev_checked: Signal::new(Default::default()),

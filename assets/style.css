@@ -1169,3 +1169,8 @@ input:focus-visible,
   flex: 1;
   min-width: 0;
 }
+
+.sheet-progress {
+  display: flex;
+  padding: 0 6px;
+}

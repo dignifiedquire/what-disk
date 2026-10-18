@@ -208,6 +208,41 @@ impl Default for View {
     }
 }
 
+/// A removal running in the background, for showing how far it got.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Removal {
+    pub to_trash: bool,
+    /// The item being removed now, the `current`-th of `count` (from 0).
+    pub name: String,
+    pub current: usize,
+    pub count: usize,
+    /// Bytes removed so far, of `total`, by the sizes in the scans.
+    pub bytes: u64,
+    pub total: u64,
+}
+
+impl Removal {
+    pub fn status(&self) -> String {
+        let of = if self.count > 1 { format!(" {} of {}", self.current + 1, self.count) } else { String::new() };
+        if self.to_trash {
+            format!("Moving “{}” to the Trash…{of}", self.name)
+        } else {
+            let (bytes, total) = (super::format::bytes(self.bytes), super::format::bytes(self.total));
+            format!("Deleting “{}”…{of} · {bytes} of {total}", self.name)
+        }
+    }
+
+    /// How far it got, from 0 to 1. Moving to the Trash takes about as long for any item,
+    /// so it counts items; deleting takes longer the more there is, so it counts bytes.
+    pub fn fraction(&self) -> f64 {
+        if self.to_trash || self.total == 0 {
+            self.current as f64 / self.count.max(1) as f64
+        } else {
+            (self.bytes as f64 / self.total as f64).min(1.0)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AppState {
     pub locations: Signal<Vec<Location>>,
@@ -218,6 +253,10 @@ pub struct AppState {
     pub rev: Signal<u64>,
     pub view: Signal<View>,
     pub review_open: Signal<bool>,
+    /// The removal running in the background, if any.
+    pub removal: Signal<Option<Removal>>,
+    /// Bumped when items are removed, so lists drop them at once, even while a scan runs.
+    pub removals: Signal<u64>,
     /// The item the open context menu acts on.
     pub context_target: Signal<Option<PathBuf>>,
     /// An overview is shown instead of the selected location.
@@ -448,6 +487,7 @@ impl AppState {
         }
         self.dev_checked.with_mut(|c| c.retain(|p| !paths.contains(p)));
         self.rev.with_mut(|r| *r += 1);
+        self.removals.with_mut(|r| *r += 1);
     }
 
     /// Asks Homebrew what is installed, in the background. `force` reloads after changes.
@@ -510,17 +550,18 @@ impl AppState {
 }
 
 /// Changes when lists computed from the scans should be recomputed: on every change while
-/// idle, but at most every ten seconds while a scan runs. Lists are computed by reading the
-/// scans from disk, which takes seconds for a whole disk.
-pub fn use_list_trigger(state: AppState) -> Memo<(bool, u64)> {
+/// idle, but at most every ten seconds while a scan runs, except after removals. Lists are
+/// computed by reading the scans from disk, which takes seconds for a whole disk.
+pub fn use_list_trigger(state: AppState) -> Memo<(bool, u64, u64)> {
     use_memo(move || {
         let rev = (state.rev)();
+        let removals = (state.removals)();
         let busy = state
             .sessions
             .peek()
             .values()
             .any(|s| matches!(s.busy(), Busy::Scanning | Busy::Rescanning(_)));
-        if busy { (true, rev / 40) } else { (false, rev) }
+        if busy { (true, rev / 40, removals) } else { (false, rev, removals) }
     })
 }
 

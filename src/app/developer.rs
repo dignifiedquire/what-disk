@@ -8,7 +8,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 
-use super::browser::show_context_menu;
+use super::browser::{show_context_menu, show_in_scan};
+use super::remove::RemovalStatus;
 use super::state::{AppState, Busy, Session, home_dir, run_list_work, use_app_state, use_list_trigger};
 use super::{format, icon_url};
 use crate::dev::{self, ArtifactKind, Language};
@@ -121,10 +122,17 @@ fn use_rows(state: AppState) -> (Signal<Vec<DevRow>>, Signal<bool>) {
         let locations = state.tool_locations.read().clone();
         async move {
             computing.set(true);
-            let found = run_list_work(move || collect(sessions, &locations)).await.unwrap_or_default();
+            let mut found = run_list_work(move || collect(sessions, &locations)).await.unwrap_or_default();
+            // Items removed while this ran may still be in it.
+            found.retain(|r| state.resolve(&r.path).is_some());
             rows.set(found);
             computing.set(false);
         }
+    });
+    // Removed items leave at once; computing the rows again takes seconds.
+    use_effect(move || {
+        let _ = (state.removals)();
+        rows.with_mut(|rows| rows.retain(|r| state.resolve(&r.path).is_some()));
     });
     (rows, computing)
 }
@@ -190,8 +198,10 @@ pub fn DevView() -> Element {
             {body}
             footer { class: "bottombar",
                 div { class: "bottombar-status",
-                    if selected.is_empty() {
-                        span { class: "status-text secondary", "Check folders to review and remove them." }
+                    if let Some(removal) = (state.removal)() {
+                        RemovalStatus { removal }
+                    } else if selected.is_empty() {
+                        span { class: "status-text secondary", "Check folders to review and remove them. Double-click one to see what is inside." }
                     } else {
                         span { class: "status-text",
                             strong { "{selected.len()} " if selected.len() == 1 { "folder" } else { "folders" } }
@@ -206,7 +216,7 @@ pub fn DevView() -> Element {
                 }
                 button {
                     class: "btn primary",
-                    disabled: selected.is_empty(),
+                    disabled: selected.is_empty() || state.removal.read().is_some(),
                     onclick: move |_| state.review_open.set(true),
                     "Review and Remove…"
                 }
@@ -236,6 +246,7 @@ fn DevItem(row: DevRow, checked: bool) -> Element {
     let mut state = use_app_state();
     let toggle_path = row.path.clone();
     let menu_path = row.path.clone();
+    let show_path = row.path.clone();
     let toggle = move || {
         let p = toggle_path.clone();
         state.dev_checked.with_mut(|c| {
@@ -257,6 +268,8 @@ fn DevItem(row: DevRow, checked: bool) -> Element {
         div {
             class: if checked { "row dev-row checked" } else { "row dev-row" },
             onclick: move |_| toggle_row(),
+            // The two clicks before it check and uncheck the row again.
+            ondoubleclick: move |_| show_in_scan(state, &show_path),
             oncontextmenu: move |e| {
                 e.prevent_default();
                 show_context_menu(state, menu_path.clone());

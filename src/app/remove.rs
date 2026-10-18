@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use dioxus::prelude::*;
 
 use super::browser::run_removal;
-use super::state::{AppState, Busy, Overview, effective_checked, is_protected, use_app_state};
+use super::state::{AppState, Busy, Overview, Removal, effective_checked, is_protected, use_app_state};
 use super::{SessionRef, format, icon_url};
 use crate::store::{NodeId, ROOT, Store};
 
@@ -27,6 +27,8 @@ pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
     let items = session.progress.files.load(Ordering::Relaxed) + session.progress.dirs.load(Ordering::Relaxed);
     let used = state.volume_of(&session.root).map(|v| v.used());
     let verb = if session.stop.load(Ordering::Relaxed) { "Pausing…" } else { "Scanning…" };
+    let removal = (state.removal)();
+    let removing = removal.is_some();
 
     let status = match busy {
         Busy::Scanning => {
@@ -74,13 +76,33 @@ pub fn BottomBar(session: SessionRef, root: NodeId) -> Element {
 
     rsx! {
         footer { class: "bottombar",
-            div { class: "bottombar-status", {status} }
+            div { class: "bottombar-status",
+                if let Some(removal) = removal {
+                    RemovalStatus { removal }
+                } else {
+                    {status}
+                }
+            }
             button {
                 class: "btn primary",
-                disabled: checked.is_empty() || busy != Busy::Idle,
+                disabled: checked.is_empty() || busy != Busy::Idle || removing,
                 onclick: move |_| state.review_open.set(true),
                 "Review and Remove…"
             }
+        }
+    }
+}
+
+/// How far the running removal got, with a bar.
+#[component]
+pub fn RemovalStatus(removal: Removal) -> Element {
+    let percent = removal.fraction() * 100.0;
+    rsx! {
+        div { class: "progress",
+            div { class: "progress-track",
+                div { class: "progress-fill", style: "width: {percent}%" }
+            }
+            span { class: "status-text", "{removal.status()}" }
         }
     }
 }
@@ -206,6 +228,9 @@ pub fn ReviewSheet() -> Element {
                             span { "{items.len()} " if items.len() == 1 { "item" } else { "items" } }
                             strong { "{format::bytes(total)}" }
                         }
+                        if let Some(removal) = (state.removal)() {
+                            div { class: "sheet-progress", RemovalStatus { removal } }
+                        }
                         div { class: "sheet-buttons",
                             button {
                                 class: "btn destructive",
@@ -214,9 +239,6 @@ pub fn ReviewSheet() -> Element {
                                 "Delete Immediately…"
                             }
                             span { class: "spacer" }
-                            if working {
-                                span { class: "spinner" }
-                            }
                             button {
                                 class: "btn",
                                 disabled: working,
